@@ -19,7 +19,7 @@ app.use((req, res, next) => {
 
 // Configurar CORS
 const corsOptions = {
-    origin: process.env.FRONTEND_URL || '*',
+    origin: process.env.FRONTEND_URL || 'http://localhost:5173',
     methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type']
 };
@@ -36,6 +36,10 @@ if (!fs.existsSync(tmpDir)) {
 startCleanupCron();
 
 // Rotas da API
+
+app.get('/health', (req, res) => {
+    res.status(200).send('OK');
+});
 
 // Upload atrelado a um lote
 app.post('/api/upload/:batchId', upload.single('video'), async (req, res) => {
