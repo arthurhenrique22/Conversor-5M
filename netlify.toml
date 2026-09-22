@@ -4,4 +4,4 @@
   publish = "dist"
 
 [build.environment]
-  SECRETS_SCAN_OMIT_KEYS = "VITE_API_URL,SECRETS_SCAN_OMIT_KEYS"
+  SECRETS_SCAN_OMIT_PATHS = "dist/**/*.js"
