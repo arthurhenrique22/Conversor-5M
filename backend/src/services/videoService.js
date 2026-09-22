@@ -1,8 +1,17 @@
 const ffmpeg = require('fluent-ffmpeg');
+const ffmpegStatic = require('ffmpeg-static');
+const ffprobeStatic = require('ffprobe-static');
 const path = require('path');
 const fs = require('fs');
 const async = require('async');
 const { ZipArchive } = require('archiver');
+
+// Set static paths explicitly
+ffmpeg.setFfmpegPath(ffmpegStatic);
+ffmpeg.setFfprobePath(ffprobeStatic.path);
+
+console.log('[FFMPEG] ffmpeg path:', ffmpegStatic);
+console.log('[FFMPEG] ffprobe path:', ffprobeStatic.path);
 
 if (process.env.FFMPEG_PATH) ffmpeg.setFfmpegPath(process.env.FFMPEG_PATH);
 if (process.env.FFPROBE_PATH) ffmpeg.setFfprobePath(process.env.FFPROBE_PATH);
