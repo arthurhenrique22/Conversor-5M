@@ -1,11 +1,36 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { v4 as uuidv4 } from 'uuid';
 import { 
-  Upload, Film, FileVideo, Download, X, Play, Trash2, CheckCircle, AlertTriangle, Cpu, Shield, Smartphone, Layers, Plus, Trash
+  Upload, Film, FileVideo, Download, X, Play, Trash2, CheckCircle, AlertTriangle, Cpu, Shield, Smartphone, Layers, Plus, Trash, Loader2
 } from 'lucide-react';
 
 const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:3005';
 const MAX_CONCURRENT_UPLOADS = 3;
+
+const normalizeProgress = (value) => {
+  if (value === undefined || value === null || value === '') return 0;
+  const num = Number(value);
+  if (!Number.isFinite(num) || isNaN(num)) return 0;
+  if (num < 0) return 0;
+  if (num > 100) return 100;
+  return num;
+};
+
+const getStatusText = (status, error) => {
+  switch (status) {
+    case 'Pronto': return 'Pronto para iniciar';
+    case 'Pendente': return 'Aguardando upload';
+    case 'Enviando': return 'Enviando para o servidor';
+    case 'Aguardando': return 'Aguardando conversão';
+    case 'Analisando vídeo': return 'Analisando vídeo...';
+    case 'Convertendo': return 'Convertendo para MP4...';
+    case 'Concluído': return 'MP4 pronto';
+    case 'Erro': return error || 'Erro no processamento';
+    case 'Cancelado': return 'Cancelado';
+    case 'Formato não suportado': return 'Formato inválido';
+    default: return status;
+  }
+};
 
 function App() {
   const [batchId, setBatchId] = useState(null);
@@ -17,7 +42,6 @@ function App() {
   const addMoreInputRef = useRef(null);
   const sseRef = useRef(null);
 
-  // Fecha SSE quando desmontar
   useEffect(() => {
     return () => {
       if (sseRef.current) sseRef.current.close();
@@ -41,7 +65,7 @@ function App() {
               ...f,
               jobId: bState.jobId,
               status: bState.status,
-              progress: bState.progress,
+              progress: normalizeProgress(bState.progress),
               error: bState.error
             };
           }
@@ -55,7 +79,6 @@ function App() {
     sseRef.current = eventSource;
   }, []);
 
-  // Processador de Upload (Fila)
   useEffect(() => {
     if (!isConverting) return;
 
@@ -112,16 +135,11 @@ function App() {
     setFiles(prev => {
       const added = [];
       newFiles.forEach(file => {
-        // Validação de duplicidade
         const isDuplicate = prev.some(p => p.name === file.name && p.size === file.size && p.lastModified === file.lastModified) || 
                             added.some(a => a.name === file.name && a.size === file.size && a.lastModified === file.lastModified);
         
-        if (isDuplicate) {
-          console.log(`Arquivo duplicado ignorado: ${file.name}`);
-          return;
-        }
+        if (isDuplicate) return;
 
-        // Validação de extensão
         const isMov = file.name.toLowerCase().endsWith('.mov');
         
         added.push({
@@ -166,9 +184,7 @@ function App() {
     setFiles(prev => prev.filter(f => f.id !== id));
   };
 
-  const clearSelection = () => {
-    setFiles([]);
-  };
+  const clearSelection = () => setFiles([]);
 
   const startConversion = () => {
     const validFiles = files.filter(f => f.status === 'Pronto');
@@ -203,14 +219,20 @@ function App() {
     return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
   };
 
-  const validFilesCount = files.filter(f => f.status === 'Pronto' || f.status === 'Pendente' || isConverting).length;
-  const totalSize = files.filter(f => f.status === 'Pronto' || f.status === 'Pendente' || isConverting).reduce((acc, curr) => acc + curr.size, 0);
+  const validFiles = files.filter(f => f.status !== 'Formato não suportado');
+  const validFilesCount = validFiles.length;
+  const totalSize = validFiles.reduce((acc, curr) => acc + curr.size, 0);
 
-  const completed = files.filter(f => f.status === 'Concluído').length;
-  const inProgress = files.filter(f => ['Enviando', 'Convertendo', 'Analisando vídeo'].includes(f.status)).length;
-  const waiting = files.filter(f => ['Pendente', 'Aguardando'].includes(f.status)).length;
+  const completed = validFiles.filter(f => f.status === 'Concluído').length;
+  const inProgress = validFiles.filter(f => ['Enviando', 'Convertendo', 'Analisando vídeo'].includes(f.status)).length;
+  const waiting = validFiles.filter(f => ['Pendente', 'Aguardando', 'Pronto'].includes(f.status)).length;
   
-  const globalProgress = validFilesCount === 0 ? 0 : (completed / validFilesCount) * 100;
+  let sumProgress = 0;
+  validFiles.forEach(f => {
+    if (f.status === 'Concluído') sumProgress += 100;
+    else if (['Enviando', 'Convertendo', 'Analisando vídeo'].includes(f.status)) sumProgress += normalizeProgress(f.progress);
+  });
+  const globalProgress = validFilesCount === 0 ? 0 : normalizeProgress(sumProgress / validFilesCount);
 
   return (
     <>
@@ -285,115 +307,110 @@ function App() {
         </div>
       </section>
 
-      {files.length > 0 && !isConverting && (
+      {files.length > 0 && (
         <section className="queue-container">
-          <div className="queue-header" style={{flexDirection: 'column', alignItems: 'flex-start', gap: '1rem'}}>
-            <div style={{display: 'flex', justifyContent: 'space-between', width: '100%', alignItems: 'center'}}>
-              <h2>{files.length} {files.length === 1 ? 'vídeo selecionado' : 'vídeos selecionados'} • {formatSize(totalSize)}</h2>
-              <div className="queue-actions">
-                <button className="btn-queue" onClick={() => addMoreInputRef.current.click()}>
-                  <Plus size={16} style={{display:'inline', verticalAlign:'middle', marginRight:'4px'}}/> Adicionar mais vídeos
-                </button>
-                <button className="btn-queue" onClick={clearSelection}>
-                  <Trash size={16} style={{display:'inline', verticalAlign:'middle', marginRight:'4px'}}/> Limpar seleção
-                </button>
-              </div>
+          <div className="queue-header-pro">
+            <div className="queue-info">
+              <h2>Fila de Conversão</h2>
+              <span className="queue-stats-badge">{validFilesCount} vídeos • {formatSize(totalSize)}</span>
             </div>
-            
-            <button className="btn-select" style={{width: '100%', padding: '1rem', fontSize: '1.1rem'}} onClick={startConversion}>
-              CONVERTER {validFilesCount} {validFilesCount === 1 ? 'VÍDEO' : 'VÍDEOS'} PARA MP4
-            </button>
-          </div>
-
-          <div className="queue-list">
-            {files.map(f => (
-              <div className="job-item" key={f.id}>
-                <div className="job-name" title={f.name}>{f.name}</div>
-                <div className="job-size">{formatSize(f.size)}</div>
-                
-                <div className="job-status-col">
-                  <span className={`status-badge ${f.status === 'Formato não suportado' ? 'Erro' : f.status}`}>{f.status}</span>
-                </div>
-
-                <div></div>
-
-                <div style={{display:'flex', gap:'0.5rem', justifyContent:'flex-end'}}>
-                  <button className="btn-icon" onClick={() => removeFile(f.id)} title="Remover">
-                    <X size={18} />
-                  </button>
-                </div>
-              </div>
-            ))}
-          </div>
-        </section>
-      )}
-
-      {files.length > 0 && isConverting && (
-        <section className="queue-container">
-          <div className="queue-header">
-            <h2>Processando {validFilesCount} {validFilesCount === 1 ? 'vídeo' : 'vídeos'}</h2>
             <div className="queue-actions">
-              <button className="btn-queue" onClick={cancelPending}>Cancelar pendentes</button>
-              <button className="btn-queue" onClick={clearCompleted}>Limpar concluídos</button>
-              {completed > 0 && (
-                <button className="btn-queue primary" onClick={downloadZip}>
-                  BAIXAR TUDO EM ZIP
-                </button>
+              {!isConverting && (
+                <>
+                  <button className="btn-queue" onClick={() => addMoreInputRef.current.click()}>
+                    <Plus size={16} /> Adicionar
+                  </button>
+                  <button className="btn-queue" onClick={clearSelection}>
+                    <Trash size={16} /> Limpar
+                  </button>
+                  <button className="btn-queue primary" onClick={startConversion}>
+                    CONVERTER TUDO
+                  </button>
+                </>
+              )}
+              {isConverting && (
+                <>
+                  <button className="btn-queue" onClick={cancelPending}>Cancelar pendentes</button>
+                  <button className="btn-queue" onClick={clearCompleted}>Limpar concluídos</button>
+                  {completed > 0 && (
+                    <button className="btn-queue primary" onClick={downloadZip}>
+                      <Download size={16} style={{marginRight: '6px'}}/> BAIXAR TUDO EM ZIP
+                    </button>
+                  )}
+                </>
               )}
             </div>
           </div>
 
-          <div className="global-progress">
-            <div className="global-stats">
-              <span>Conversão em andamento ({completed} de {validFilesCount} concluídos)</span>
-              <span>{Math.round(globalProgress)}%</span>
+          {isConverting && (
+            <div className="global-progress-pro">
+              <div className="gp-header">
+                <span className="gp-title">Progresso Geral</span>
+                <span className="gp-percentage">{Math.round(globalProgress)}%</span>
+              </div>
+              <div className="gp-track">
+                <div className="gp-fill" style={{width: `${globalProgress}%`}}></div>
+              </div>
+              <div className="gp-footer">
+                <div className="gp-stat"><div className="dot waiting"></div>{waiting} aguardando</div>
+                <div className="gp-stat"><div className="dot in-progress"></div>{inProgress} processando</div>
+                <div className="gp-stat"><div className="dot completed"></div>{completed} concluídos</div>
+              </div>
             </div>
-            <div className="progress-track">
-              <div className="progress-fill" style={{width: `${globalProgress}%`}}></div>
-            </div>
-            <div className="global-stats" style={{marginTop: '0.5rem', marginBottom: 0}}>
-              <span>{inProgress} convertendo/enviando • {waiting} aguardando • {completed} concluídos</span>
-            </div>
-          </div>
+          )}
 
-          <div className="queue-list">
-            {files.map(f => (
-              f.status !== 'Formato não suportado' && (
-                <div className="job-item" key={f.id}>
-                  <div className="job-name" title={f.name}>{f.name}</div>
-                  <div className="job-size">{formatSize(f.size)}</div>
+          <div className="queue-list-pro">
+            {files.map(f => {
+              const isProcessing = ['Enviando', 'Convertendo', 'Analisando vídeo'].includes(f.status);
+              const isDone = f.status === 'Concluído';
+              const isError = f.status === 'Erro' || f.status === 'Formato não suportado';
+              
+              let progressValue = normalizeProgress(f.progress);
+              if (isDone) progressValue = 100;
+              
+              return (
+                <div className={`job-item-pro ${f.status}`} key={f.id}>
+                  <div className="job-info-col">
+                    <div className="job-name" title={f.name}>
+                      <Film size={18} className="job-icon-file" />
+                      {f.name}
+                    </div>
+                    <div className="job-size">{formatSize(f.size)}</div>
+                  </div>
                   
                   <div className="job-status-col">
-                    <span className={`status-badge ${f.status}`}>
-                      {f.status === 'Pendente' ? 'Aguardando upload' : f.status}
-                    </span>
-                    {f.status === 'Convertendo' && (
-                      <div className="job-progress-bar">
-                        <div style={{width: `${f.progress}%`}}></div>
+                    <div className="job-status-text">
+                      <span className={`status-dot ${f.status}`}></span>
+                      {getStatusText(f.status, f.error)}
+                      {isProcessing && f.status === 'Convertendo' && (
+                        <span className="job-percentage">{Math.round(progressValue)}%</span>
+                      )}
+                    </div>
+                    
+                    <div className="job-progress-wrapper">
+                      <div className={`job-progress-bg ${isProcessing ? 'active' : ''} ${isDone ? 'done' : ''} ${isError ? 'error' : ''}`}>
+                        <div 
+                          className={`job-progress-fill ${f.status} ${isProcessing && f.status !== 'Convertendo' ? 'indeterminate' : ''}`} 
+                          style={{width: `${progressValue}%`}}
+                        ></div>
                       </div>
-                    )}
+                    </div>
                   </div>
 
-                  <div style={{fontSize: '0.85rem', color: 'var(--text-muted)'}}>
-                    {f.status === 'Convertendo' ? `${f.progress}%` : ''}
-                    {f.status === 'Erro' ? f.error : ''}
-                  </div>
-
-                  <div style={{display:'flex', gap:'0.5rem', justifyContent:'flex-end'}}>
-                    {f.status === 'Concluído' && (
-                      <button className="btn-icon download" onClick={() => downloadSingle(f.jobId)} title="Baixar MP4">
-                        <Download size={18} />
+                  <div className="job-actions-col">
+                    {isDone ? (
+                      <button className="btn-download-pro" onClick={() => downloadSingle(f.jobId)}>
+                        <Download size={16} /> BAIXAR MP4
                       </button>
-                    )}
-                    {f.status !== 'Concluído' && (
-                      <button className="btn-icon" onClick={() => removeFile(f.id)} title="Remover/Cancelar">
-                        <Trash2 size={18} />
+                    ) : (
+                      <button className="btn-icon-pro" onClick={() => removeFile(f.id)} title="Remover">
+                        <X size={18} />
                       </button>
                     )}
                   </div>
                 </div>
-              )
-            ))}
+              );
+            })}
           </div>
         </section>
       )}
