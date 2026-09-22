@@ -3,3 +3,6 @@
 
 [phases.setup]
   nixPkgs = ["...", "ffmpeg"]
+
+[start]
+  cmd = "npm start"
