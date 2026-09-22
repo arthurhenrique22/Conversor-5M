@@ -4,4 +4,4 @@
   publish = "dist"
 
 [build.environment]
-  SECRETS_SCAN_OMIT_PATHS = "dist/**/*.js"
+  SECRETS_SCAN_OMIT_PATHS = "dist/,frontend/dist/"
