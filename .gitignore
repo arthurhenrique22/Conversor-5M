@@ -1,0 +1,16 @@
+node_modules/
+.env
+.env.local
+*.log
+test.mov
+tmp/
+dist/
+.DS_Store
+backend/inspect_railway.js
+backend/test_header_sessions.js
+backend/test_live_upload.js
+backend/test_paths.js
+backend/test_sessions.js
+package.json
+package-lock.json
+

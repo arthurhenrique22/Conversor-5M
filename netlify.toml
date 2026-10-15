@@ -4,4 +4,5 @@
   publish = "dist"
 
 [build.environment]
+  VITE_API_URL = "https://conversor-5m-production.up.railway.app"
   SECRETS_SCAN_OMIT_PATHS = "dist/,frontend/dist/"

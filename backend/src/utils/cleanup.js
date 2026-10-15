@@ -31,19 +31,21 @@ const cleanupFiles = () => {
 };
 
 const cleanupMemory = () => {
-    // Também limpa metadados de lotes que já expiraram para não estourar RAM
-    // Consideramos "expirado" se não tem conexões SSE e a última atividade foi muito antiga, mas sem um timestamp exato é difícil.
-    // Vamos varrer os lotes, se não tiver cliente pendente, verificamos se todos os arquivos estão "Concluído", "Erro" ou "Cancelado".
-    // Se a idade pudesse ser rastreada seria melhor, mas podemos usar o próprio garbage collection ao remover.
-    // Como simplificação: limpar a memória é seguro após algumas horas, mas podemos ignorar neste MVP ou implementar algo simples
-    
-    // Deixaremos para o MVP a limpeza apenas de arquivos físicos, o mapa cresce devagar (apenas nomes). 
+    const now = Date.now();
+    for (const [batchId, bData] of batches.entries()) {
+        if (bData.createdAt && (now - bData.createdAt > RETENTION_MS)) {
+            batches.delete(batchId);
+            batchClients.delete(batchId);
+            console.log(`[Limpeza RAM] Metadados do lote expirado removidos: ${batchId}`);
+        }
+    }
 };
 
 const startCleanupCron = () => {
     // Roda a cada 5 minutos
     setInterval(() => {
         cleanupFiles();
+        cleanupMemory();
     }, 5 * 60 * 1000);
     console.log('[Sistema] Cron de limpeza iniciado.');
 };

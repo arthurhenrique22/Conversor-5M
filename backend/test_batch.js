@@ -25,16 +25,19 @@ async function runBatchTest() {
     }
     
     const batchId = 'test-batch-999';
+    const testSessionId = 'test-session-batch-999';
     console.log(`[E2E BATCH TEST] Gerados ${numFiles} arquivos. Enviando para o lote ${batchId}...`);
     
     const jobIds = [];
     
-    // Simular upload de todos (não precisa limitar no script pq axios cuida disso)
+    // Simular upload de todos
     for (let fp of filePaths) {
         const form = new FormData();
         form.append('video', fs.createReadStream(fp));
         
-        const res = await axios.post(`http://localhost:3005/api/upload/${batchId}`, form, { headers: form.getHeaders() });
+        const res = await axios.post(`http://localhost:3005/api/upload/${batchId}`, form, { 
+            headers: form.getHeaders()
+        });
         jobIds.push(res.data.jobId);
         console.log(`Upload concluído: ${res.data.originalName} -> ${res.data.jobId}`);
     }

@@ -5,6 +5,7 @@ const path = require('path');
 const fs = require('fs');
 const async = require('async');
 const { ZipArchive } = require('archiver');
+const { MAX_GLOBAL_QUEUE, MAX_USER_ACTIVE_JOBS } = require('../utils/systemLimits');
 
 // Set static paths explicitly
 ffmpeg.setFfmpegPath(ffmpegStatic);
@@ -23,17 +24,23 @@ const MAX_CONCURRENT_CONVERSIONS = process.env.MAX_CONCURRENT_CONVERSIONS ? pars
 // clients[batchId] = Set<Response>
 const batchClients = new Map();
 
-// batches[batchId] = Map<jobId, stateObject>
+// batches[batchId] = { sessionId, jobs: Map<jobId, stateObject> }
 const batches = new Map();
 
 // ffmpegCommands[jobId] = command (para cancelamento)
 const ffmpegCommands = new Map();
 
-const getDuration = (filePath) => {
+const analyzeVideo = (filePath) => {
     return new Promise((resolve, reject) => {
         ffmpeg.ffprobe(filePath, (err, metadata) => {
             if (err) return reject(err);
-            resolve(metadata.format.duration);
+            const videoStream = metadata.streams.find(s => s.codec_type === 'video');
+            const audioStream = metadata.streams.find(s => s.codec_type === 'audio');
+            resolve({
+                duration: metadata.format.duration,
+                videoCodec: videoStream ? videoStream.codec_name : null,
+                audioCodec: audioStream ? audioStream.codec_name : null,
+            });
         });
     });
 };
@@ -42,11 +49,11 @@ const notifyBatchClients = (batchId) => {
     const clients = batchClients.get(batchId);
     if (!clients || clients.size === 0) return;
     
-    const batchJobs = batches.get(batchId);
-    if (!batchJobs) return;
+    const batchData = batches.get(batchId);
+    if (!batchData) return;
     
     // Converte os Map values para array serializável
-    const batchState = Array.from(batchJobs.values());
+    const batchState = Array.from(batchData.jobs.values());
     const message = `data: ${JSON.stringify(batchState)}\n\n`;
     
     clients.forEach(res => {
@@ -55,10 +62,10 @@ const notifyBatchClients = (batchId) => {
 };
 
 const updateJobState = (batchId, jobId, stateUpdates) => {
-    if (!batches.has(batchId)) {
-        batches.set(batchId, new Map());
-    }
-    const batchJobs = batches.get(batchId);
+    const batchData = batches.get(batchId);
+    if (!batchData) return;
+    
+    const batchJobs = batchData.jobs;
     const currentState = batchJobs.get(jobId) || { jobId, batchId, progress: 0 };
     batchJobs.set(jobId, { ...currentState, ...stateUpdates });
     
@@ -70,38 +77,52 @@ const conversionQueue = async.queue(async (task) => {
     const { batchId, jobId, inputPath, originalName, outputPath } = task;
     
     // Antes de iniciar, verifica se o job não foi cancelado/deletado enquanto aguardava
-    const batchJobs = batches.get(batchId);
-    if (!batchJobs || !batchJobs.has(jobId)) {
+    const batchData = batches.get(batchId);
+    if (!batchData || !batchData.jobs.has(jobId)) {
         return; // Job cancelado
     }
     
-    const currentState = batchJobs.get(jobId);
+    const currentState = batchData.jobs.get(jobId);
     if (currentState && currentState.status === 'Cancelado') return;
     
     updateJobState(batchId, jobId, { status: 'Analisando vídeo', progress: 0 });
 
-    let duration;
+    let analysis;
     try {
-        duration = await getDuration(inputPath);
+        analysis = await analyzeVideo(inputPath);
     } catch (err) {
         console.error(`Erro ffprobe no job ${jobId}:`, err);
         updateJobState(batchId, jobId, { status: 'Erro', error: 'Não foi possível analisar este vídeo.', progress: 0 });
         return;
     }
 
+    const { duration, videoCodec, audioCodec } = analysis;
     updateJobState(batchId, jobId, { status: 'Convertendo', progress: 0 });
 
     return new Promise((resolve) => {
-        const command = ffmpeg(inputPath)
-            .output(outputPath)
-            .videoCodec('libx264')
-            .audioCodec('aac')
-            .outputOptions([
-                '-movflags +faststart',
-                '-preset fast',
-                '-crf 23'
-            ])
-            .on('progress', (progressInfo) => {
+        let command = ffmpeg(inputPath).output(outputPath);
+
+        // Otimização: se o codec de vídeo for h264 ou hevc, não precisa recodificar, apenas copiar o stream
+        if (videoCodec === 'h264') {
+            command = command.videoCodec('copy');
+        } else if (videoCodec === 'hevc') {
+            // Tag hvc1 garante compatibilidade do MP4 com Apple QuickTime, iPhone e Safari
+            command = command.videoCodec('copy').outputOptions(['-tag:v hvc1']);
+        } else {
+            command = command.videoCodec('libx264')
+                             .outputOptions(['-preset veryfast', '-crf 23']);
+        }
+
+        // Otimização: se o codec de áudio já for aac, copiar
+        if (audioCodec === 'aac') {
+            command = command.audioCodec('copy');
+        } else {
+            command = command.audioCodec('aac');
+        }
+
+        command = command.outputOptions(['-movflags +faststart']);
+
+        command.on('progress', (progressInfo) => {
                 let percent = 0;
                 if (progressInfo.percent) {
                     percent = progressInfo.percent;
@@ -150,11 +171,35 @@ const conversionQueue = async.queue(async (task) => {
     });
 }, MAX_CONCURRENT_CONVERSIONS);
 
-const startConversion = async (batchId, inputPath, originalName, jobId) => {
+const startConversion = async (batchId, sessionId, inputPath, originalName, jobId) => {
+    // Verificar limites globais
+    if (conversionQueue.length() + conversionQueue.running() >= MAX_GLOBAL_QUEUE) {
+        throw { status: 503, message: 'Fila do servidor cheia. Tente mais tarde.' };
+    }
+
+    if (!batches.has(batchId)) {
+        batches.set(batchId, { sessionId: sessionId || null, createdAt: Date.now(), jobs: new Map() });
+    }
+
+    const batchData = batches.get(batchId);
+
+    // Contar jobs ativos no lote para evitar spam excessivo
+    let activeBatchJobs = 0;
+    for (const jState of batchData.jobs.values()) {
+        if (['Aguardando', 'Analisando vídeo', 'Convertendo', 'Pendente', 'Enviando'].includes(jState.status)) {
+            activeBatchJobs++;
+        }
+    }
+
+    if (activeBatchJobs >= MAX_USER_ACTIVE_JOBS) {
+        throw { status: 429, message: `Limite de ${MAX_USER_ACTIVE_JOBS} vídeos simultâneos por lote atingido.` };
+    }
+
     const outputPath = path.join(path.dirname(inputPath), `${jobId}.mp4`);
     
     // Inicializa o estado
-    updateJobState(batchId, jobId, { 
+    batchData.jobs.set(jobId, { 
+        jobId, batchId,
         status: 'Aguardando', 
         progress: 0, 
         originalName,
@@ -162,17 +207,19 @@ const startConversion = async (batchId, inputPath, originalName, jobId) => {
         outputPath
     });
 
+    notifyBatchClients(batchId);
+
     // Envia para a fila
     conversionQueue.push({ batchId, jobId, inputPath, originalName, outputPath });
     
     return jobId;
 };
 
-const cancelConversion = (batchId, jobId) => {
-    const batchJobs = batches.get(batchId);
-    if (!batchJobs || !batchJobs.has(jobId)) return false;
+const cancelConversion = (batchId, jobId, sessionId) => {
+    const batchData = batches.get(batchId);
+    if (!batchData || !batchData.jobs.has(jobId)) return false;
     
-    const jobState = batchJobs.get(jobId);
+    const jobState = batchData.jobs.get(jobId);
     
     // Se está na fila e não começou, apenas marcamos cancelado para pular
     if (jobState.status === 'Aguardando') {
@@ -182,7 +229,7 @@ const cancelConversion = (batchId, jobId) => {
         return true;
     }
     
-    // Se está convertendo, mata o FFmpeg
+    // Se está convertendo, encerra o processo FFmpeg
     if (jobState.status === 'Analisando vídeo' || jobState.status === 'Convertendo') {
         const command = ffmpegCommands.get(jobId);
         if (command) {
@@ -198,10 +245,12 @@ const cancelConversion = (batchId, jobId) => {
 
 const getBatchProgress = (req, res) => {
     const batchId = req.params.batchId;
-    
+    const batchData = batches.get(batchId);
+
     res.setHeader('Content-Type', 'text/event-stream');
-    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
     res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
     res.flushHeaders();
 
     if (!batchClients.has(batchId)) {
@@ -211,15 +260,22 @@ const getBatchProgress = (req, res) => {
     clients.add(res);
 
     // Envia o estado atual imediatamente
-    const batchJobs = batches.get(batchId);
-    if (batchJobs) {
-        const batchState = Array.from(batchJobs.values());
+    if (batchData) {
+        const batchState = Array.from(batchData.jobs.values());
         res.write(`data: ${JSON.stringify(batchState)}\n\n`);
     } else {
         res.write(`data: []\n\n`);
     }
 
+    // Heartbeat a cada 15 segundos para manter a conexão ativa através de proxies e roteadores
+    const heartbeatTimer = setInterval(() => {
+        if (!res.writableEnded) {
+            res.write(': heartbeat\n\n');
+        }
+    }, 15000);
+
     req.on('close', () => {
+        clearInterval(heartbeatTimer);
         clients.delete(res);
         if (clients.size === 0) {
             batchClients.delete(batchId);
@@ -228,25 +284,21 @@ const getBatchProgress = (req, res) => {
 };
 
 const downloadFile = (req, res) => {
-    const jobId = req.params.id;
+    const { batchId, jobId } = req.params;
     const outputPath = path.join(__dirname, '../../tmp', `${jobId}.mp4`);
     
     if (fs.existsSync(outputPath)) {
-        // Precisamos encontrar o nome original vasculhando os lotes, ou enviar nome genérico.
-        let downloadName = `${jobId}.mp4`;
-        for (const [bId, bJobs] of batches.entries()) {
-            if (bJobs.has(jobId)) {
-                const jobState = bJobs.get(jobId);
-                downloadName = jobState.originalName.replace(/\.mov$/i, '.mp4');
-                break;
-            }
+        const batchData = batches.get(batchId);
+        if (batchData && batchData.jobs.has(jobId)) {
+            const jobState = batchData.jobs.get(jobId);
+            const downloadName = jobState.originalName.replace(/\.mov$/i, '.mp4');
+            return res.download(outputPath, downloadName, (err) => {
+                if (err && !res.headersSent) {
+                    res.status(500).json({ error: 'Erro ao fazer download do arquivo.' });
+                }
+            });
         }
-            
-        res.download(outputPath, downloadName, (err) => {
-            if (err && !res.headersSent) {
-                res.status(500).json({ error: 'Erro ao fazer download do arquivo.' });
-            }
-        });
+        return res.status(403).json({ error: 'Acesso negado ou lote inválido.' });
     } else {
         res.status(404).json({ error: 'O arquivo expirou ou não existe.' });
     }
@@ -254,14 +306,14 @@ const downloadFile = (req, res) => {
 
 const downloadZip = (req, res) => {
     const batchId = req.params.batchId;
-    const batchJobs = batches.get(batchId);
+    const batchData = batches.get(batchId);
     
-    if (!batchJobs) {
-        return res.status(404).json({ error: 'Lote não encontrado.' });
+    if (!batchData) {
+        return res.status(404).json({ error: 'Lote não encontrado ou expirado.' });
     }
 
     const filesToZip = [];
-    for (const jobState of batchJobs.values()) {
+    for (const jobState of batchData.jobs.values()) {
         if (jobState.status === 'Concluído' && fs.existsSync(jobState.outputPath)) {
             filesToZip.push({
                 path: jobState.outputPath,

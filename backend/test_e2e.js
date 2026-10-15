@@ -16,17 +16,23 @@ async function runTest() {
     const form = new FormData();
     form.append('video', fs.createReadStream(filePath));
     
+    const batchId = 'e2e-single-batch';
+    const testSessionId = 'e2e-session-123';
+
     try {
         console.log('[E2E TEST] Fazendo upload...');
-        const res = await axios.post('http://localhost:3005/api/upload', form, {
-            headers: form.getHeaders()
+        const res = await axios.post(`http://localhost:3005/api/upload/${batchId}`, form, {
+            headers: {
+                ...form.getHeaders(),
+                'x-session-id': testSessionId
+            }
         });
         
         console.log('[E2E TEST] Upload sucesso:', res.data);
         const jobId = res.data.jobId;
         
         console.log('[E2E TEST] Conectando ao SSE...');
-        http.get(`http://localhost:3005/api/progress/${jobId}`, (sseRes) => {
+        http.get(`http://localhost:3005/api/progress/batch/${batchId}?sessionId=${testSessionId}`, (sseRes) => {
             let buffer = '';
             sseRes.on('data', (chunk) => {
                 buffer += chunk.toString();
@@ -35,12 +41,14 @@ async function runTest() {
                 
                 for (let line of lines) {
                     if (line.startsWith('data: ')) {
-                        const data = JSON.parse(line.slice(6));
+                        const batchData = JSON.parse(line.slice(6));
+                        const data = batchData.find(j => j.jobId === jobId) || batchData[0];
+                        if (!data) continue;
                         console.log(`[SSE] ${data.status} - Progresso: ${data.progress}%`);
                         
                         if (data.status === 'Concluído') {
                             console.log('[E2E TEST] Download...');
-                            axios.get(`http://localhost:3005/api/download/${jobId}`, { responseType: 'stream' })
+                            axios.get(`http://localhost:3005/api/download/${batchId}/${jobId}?sessionId=${testSessionId}`, { responseType: 'stream' })
                                 .then(dRes => {
                                     console.log('[E2E TEST] Download OK! Status:', dRes.status);
                                     process.exit(0);

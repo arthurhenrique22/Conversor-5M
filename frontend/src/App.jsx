@@ -1,10 +1,21 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { v4 as uuidv4 } from 'uuid';
 import { 
-  Upload, Film, FileVideo, Download, X, Play, Trash2, CheckCircle, AlertTriangle, Cpu, Shield, Smartphone, Layers, Plus, Trash, Loader2
+  Upload, Film, FileVideo, Download, X, Play, Shield, Smartphone, Layers, Plus, Trash, RotateCcw
 } from 'lucide-react';
+import AdSenseBlock from './components/AdSenseBlock';
 
-const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:3005';
+const getApiUrl = () => {
+  if (import.meta.env.VITE_API_URL) {
+    return import.meta.env.VITE_API_URL.replace(/\/$/, '');
+  }
+  if (import.meta.env.PROD) {
+    return 'https://conversor-5m-production.up.railway.app';
+  }
+  return 'http://localhost:3005';
+};
+
+const API_URL = getApiUrl();
 const MAX_CONCURRENT_UPLOADS = 3;
 
 const normalizeProgress = (value) => {
@@ -16,18 +27,49 @@ const normalizeProgress = (value) => {
   return num;
 };
 
+const formatErrorMessage = (error) => {
+  if (!error) return 'Ocorreu um erro inesperado.';
+  const msg = typeof error === 'string' ? error : (error.message || '');
+  
+  if (msg.includes('Failed to fetch') || msg.includes('NetworkError') || msg.includes('net::ERR') || msg.includes('Failed to load')) {
+    return 'Não foi possível conectar ao servidor. Verifique sua conexão ou tente novamente.';
+  }
+  if (msg.includes('Lote pertence a outra sessão') || msg.includes('403') || msg.includes('Acesso negado')) {
+    return 'Sessão expirada ou não autorizada. Recarregue a página.';
+  }
+  if (msg.includes('Limite de armazenamento') || msg.includes('503')) {
+    return 'Servidor temporariamente ocupado. Tente novamente em instantes.';
+  }
+  if (msg.includes('Limite de') && msg.includes('simultâneos')) {
+    return msg;
+  }
+  if (msg.includes('Formato não suportado') || msg.includes('arquivo MOV')) {
+    return 'Formato inválido. Use um arquivo de vídeo MOV.';
+  }
+  if (msg.includes('Arquivo muito grande') || msg.includes('file too large')) {
+    return 'O arquivo excede o limite máximo permitido de 500 MB.';
+  }
+  if (msg.includes('Erro no servidor') || msg.includes('Falha no upload')) {
+    return 'Não foi possível enviar o vídeo para o servidor. Tente novamente.';
+  }
+  if (msg.includes('conversão') || msg.includes('processamento') || msg.includes('FFmpeg')) {
+    return 'Ocorreu um problema durante a conversão deste arquivo.';
+  }
+  return msg;
+};
+
 const getStatusText = (status, error) => {
   switch (status) {
     case 'Pronto': return 'Pronto para iniciar';
-    case 'Pendente': return 'Aguardando upload';
-    case 'Enviando': return 'Enviando para o servidor';
+    case 'Pendente': return 'Aguardando envio';
+    case 'Enviando': return 'Enviando para o servidor...';
     case 'Aguardando': return 'Aguardando conversão';
     case 'Analisando vídeo': return 'Analisando vídeo...';
     case 'Convertendo': return 'Convertendo para MP4...';
     case 'Concluído': return 'MP4 pronto';
-    case 'Erro': return error || 'Erro no processamento';
+    case 'Erro': return formatErrorMessage(error);
     case 'Cancelado': return 'Cancelado';
-    case 'Formato não suportado': return 'Formato inválido';
+    case 'Formato não suportado': return 'Formato inválido (use .mov)';
     default: return status;
   }
 };
@@ -38,41 +80,58 @@ function App() {
   const [isDragging, setIsDragging] = useState(false);
   const [isConverting, setIsConverting] = useState(false);
   
+  const batchIdRef = useRef(null);
   const fileInputRef = useRef(null);
   const addMoreInputRef = useRef(null);
   const sseRef = useRef(null);
 
   useEffect(() => {
     return () => {
-      if (sseRef.current) sseRef.current.close();
+      if (sseRef.current) {
+        sseRef.current.close();
+        sseRef.current = null;
+      }
     };
   }, []);
 
   const connectSSE = useCallback((currentBatchId) => {
+    if (!currentBatchId) return;
     if (sseRef.current) return;
     
     console.log('[SSE] Conectando ao lote:', currentBatchId);
-    const eventSource = new EventSource(`${API_URL}/api/progress/batch/${currentBatchId}`);
+    const eventSource = new EventSource(
+      `${API_URL}/api/progress/batch/${currentBatchId}`, 
+      { withCredentials: true }
+    );
     
     eventSource.onmessage = (event) => {
       try {
         const batchState = JSON.parse(event.data);
+        if (!Array.isArray(batchState)) return;
+
         setFiles(prev => prev.map(f => {
-          const bState = batchState.find(b => b.originalName === f.name);
+          const bState = batchState.find(b => (f.jobId && b.jobId === f.jobId) || b.originalName === f.name);
           if (bState) {
             if (f.status === 'Enviando' || f.status === 'Pendente') return f;
             return {
               ...f,
-              jobId: bState.jobId,
+              jobId: bState.jobId || f.jobId,
               status: bState.status,
               progress: normalizeProgress(bState.progress),
-              error: bState.error
+              error: bState.error ? formatErrorMessage(bState.error) : f.error
             };
           }
           return f;
         }));
       } catch (err) {
         console.error('Erro ao processar SSE:', err);
+      }
+    };
+
+    eventSource.onerror = (err) => {
+      console.warn('[SSE] EventSource aviso ou reconexão:', err);
+      if (eventSource.readyState === EventSource.CLOSED) {
+        sseRef.current = null;
       }
     };
     
@@ -82,51 +141,50 @@ function App() {
   useEffect(() => {
     if (!isConverting) return;
 
-    const uploadNext = async () => {
-      const uploadingCount = files.filter(f => f.status === 'Enviando').length;
-      if (uploadingCount >= MAX_CONCURRENT_UPLOADS) return;
+    const uploadingFiles = files.filter(f => f.status === 'Enviando');
+    const availableSlots = MAX_CONCURRENT_UPLOADS - uploadingFiles.length;
+    if (availableSlots <= 0) return;
 
-      const nextFile = files.find(f => f.status === 'Pendente');
-      if (!nextFile) return;
+    const pendingFiles = files.filter(f => f.status === 'Pendente').slice(0, availableSlots);
+    if (pendingFiles.length === 0) return;
 
-      setFiles(prev => prev.map(f => f.id === nextFile.id ? { ...f, status: 'Enviando', progress: 0 } : f));
-      
-      let currentBatchId = batchId;
-      if (!currentBatchId) {
-        currentBatchId = uuidv4();
-        setBatchId(currentBatchId);
-        connectSSE(currentBatchId);
-      } else if (!sseRef.current) {
-        connectSSE(currentBatchId);
-      }
+    let currentBatchId = batchIdRef.current;
+    if (!currentBatchId) {
+      currentBatchId = batchId || uuidv4();
+      batchIdRef.current = currentBatchId;
+    }
+    connectSSE(currentBatchId);
 
+    const pendingIds = new Set(pendingFiles.map(f => f.id));
+    setFiles(prev => prev.map(f => pendingIds.has(f.id) ? { ...f, status: 'Enviando', progress: 0 } : f));
+
+    pendingFiles.forEach(async (fileItem) => {
       const formData = new FormData();
-      formData.append('video', nextFile.file);
+      formData.append('video', fileItem.file);
 
       try {
         const response = await fetch(`${API_URL}/api/upload/${currentBatchId}`, {
           method: 'POST',
-          body: formData
+          body: formData,
+          credentials: 'include'
         });
 
         if (!response.ok) {
-          const errData = await response.json().catch(()=>({error: 'Falha no upload'}));
-          throw new Error(errData.error || 'Erro no servidor');
+          const errData = await response.json().catch(() => ({ error: 'Falha no upload' }));
+          throw new Error(errData.error || `Erro HTTP ${response.status}`);
         }
 
         const data = await response.json();
-        
         setFiles(prev => prev.map(f => 
-          f.id === nextFile.id ? { ...f, jobId: data.jobId, status: 'Aguardando', progress: 0 } : f
+          f.id === fileItem.id ? { ...f, jobId: data.jobId, status: 'Aguardando', progress: 0 } : f
         ));
       } catch (error) {
+        console.error(`[Upload] Falha ao enviar vídeo ${fileItem.name}:`, error);
         setFiles(prev => prev.map(f => 
-          f.id === nextFile.id ? { ...f, status: 'Erro', error: error.message } : f
+          f.id === fileItem.id ? { ...f, status: 'Erro', error: formatErrorMessage(error) } : f
         ));
       }
-    };
-
-    uploadNext();
+    });
   }, [files, batchId, connectSSE, isConverting]);
 
   const handleFilesAdded = (newFilesList) => {
@@ -150,7 +208,8 @@ function App() {
           lastModified: file.lastModified,
           status: isMov ? 'Pronto' : 'Formato não suportado',
           progress: 0,
-          jobId: null
+          jobId: null,
+          error: null
         });
       });
       return [...prev, ...added];
@@ -174,9 +233,13 @@ function App() {
     const file = files.find(f => f.id === id);
     if (!file) return;
 
-    if (isConverting && file.jobId && (file.status === 'Aguardando' || file.status === 'Convertendo' || file.status === 'Analisando vídeo')) {
+    const currentBatch = batchIdRef.current || batchId;
+    if (isConverting && currentBatch && file.jobId && (file.status === 'Aguardando' || file.status === 'Convertendo' || file.status === 'Analisando vídeo')) {
       try {
-        await fetch(`${API_URL}/api/cancel/${batchId}/${file.jobId}`, { method: 'POST' });
+        await fetch(`${API_URL}/api/cancel/${currentBatch}/${file.jobId}`, { 
+          method: 'POST',
+          credentials: 'include'
+        });
       } catch (e) {
         console.error('Erro ao cancelar', e);
       }
@@ -184,12 +247,40 @@ function App() {
     setFiles(prev => prev.filter(f => f.id !== id));
   };
 
-  const clearSelection = () => setFiles([]);
+  const retryFile = (id) => {
+    let currentBatch = batchIdRef.current;
+    if (!currentBatch) {
+      currentBatch = batchId || uuidv4();
+      batchIdRef.current = currentBatch;
+      setBatchId(currentBatch);
+    }
+    connectSSE(currentBatch);
+    setIsConverting(true);
+    setFiles(prev => prev.map(f => f.id === id ? { ...f, status: 'Pendente', progress: 0, error: null } : f));
+  };
+
+  const clearSelection = () => {
+    setFiles([]);
+    setIsConverting(false);
+    if (sseRef.current) {
+      sseRef.current.close();
+      sseRef.current = null;
+    }
+    batchIdRef.current = null;
+    setBatchId(null);
+  };
 
   const startConversion = () => {
     const validFiles = files.filter(f => f.status === 'Pronto');
     if (validFiles.length === 0) return;
 
+    let currentBatch = batchIdRef.current;
+    if (!currentBatch) {
+      currentBatch = uuidv4();
+      batchIdRef.current = currentBatch;
+      setBatchId(currentBatch);
+    }
+    connectSSE(currentBatch);
     setIsConverting(true);
     setFiles(prev => prev.map(f => f.status === 'Pronto' ? { ...f, status: 'Pendente' } : f));
   };
@@ -204,14 +295,25 @@ function App() {
     setFiles(prev => prev.filter(f => f.status !== 'Concluído'));
   };
 
+  const triggerDownload = (url) => {
+    const link = document.createElement('a');
+    link.href = url;
+    link.setAttribute('download', '');
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  };
+
   const downloadZip = () => {
-    if (!batchId) return;
-    window.location.href = `${API_URL}/api/download/batch/${batchId}/zip`;
+    const currentBatch = batchIdRef.current || batchId;
+    if (!currentBatch) return;
+    triggerDownload(`${API_URL}/api/download/batch/${currentBatch}/zip`);
   };
 
   const downloadSingle = (jobId) => {
-    if (!jobId) return;
-    window.location.href = `${API_URL}/api/download/${jobId}`;
+    const currentBatch = batchIdRef.current || batchId;
+    if (!jobId || !currentBatch) return;
+    triggerDownload(`${API_URL}/api/download/${currentBatch}/${jobId}`);
   };
 
   const formatSize = (bytes) => {
@@ -226,6 +328,7 @@ function App() {
   const completed = validFiles.filter(f => f.status === 'Concluído').length;
   const inProgress = validFiles.filter(f => ['Enviando', 'Convertendo', 'Analisando vídeo'].includes(f.status)).length;
   const waiting = validFiles.filter(f => ['Pendente', 'Aguardando', 'Pronto'].includes(f.status)).length;
+  const failedCount = validFiles.filter(f => f.status === 'Erro').length;
   
   let sumProgress = 0;
   validFiles.forEach(f => {
@@ -233,6 +336,20 @@ function App() {
     else if (['Enviando', 'Convertendo', 'Analisando vídeo'].includes(f.status)) sumProgress += normalizeProgress(f.progress);
   });
   const globalProgress = validFilesCount === 0 ? 0 : normalizeProgress(sumProgress / validFilesCount);
+
+  const isFinished = isConverting && validFilesCount > 0 && validFiles.every(f => ['Concluído', 'Erro', 'Cancelado', 'Formato não suportado'].includes(f.status));
+
+  useEffect(() => {
+    if (isFinished && sseRef.current) {
+      sseRef.current.close();
+      sseRef.current = null;
+    }
+  }, [isFinished]);
+
+  const addMoreAfterFinish = () => {
+    setIsConverting(false);
+    addMoreInputRef.current.click();
+  };
 
   return (
     <>
@@ -247,17 +364,19 @@ function App() {
           <a href="#">Vantagens</a>
           <a href="#">Perguntas</a>
         </nav>
-        <button className="btn-header" onClick={() => document.getElementById('workspace').scrollIntoView({behavior:'smooth'})}>
+        <button className="btn-header" onClick={() => document.getElementById('workspace')?.scrollIntoView({behavior:'smooth'})}>
           Converter agora
         </button>
       </header>
 
       <section className="hero">
-        <div className="hero-badge">Rápido • Seguro • Conversão em massa</div>
         <h1>Conversor de <span className="highlight">MOV para MP4</span></h1>
         <p>Converta seus vídeos MOV para MP4 de forma rápida, simples e gratuita. Envie dezenas de vídeos de uma só vez e baixe tudo quando terminar.</p>
         <p style={{fontSize: '0.9rem', marginTop: '1rem', color: 'var(--text-muted)'}}>OS 5 MAIORES HOMENS INTELIGENTES DA TERRA</p>
       </section>
+
+      {/* Bloco de anúncio centralizado antes da área de conversão */}
+      <AdSenseBlock />
 
       <section className="workspace" id="workspace">
         <div className="lateral-card left">
@@ -272,7 +391,7 @@ function App() {
           onDrop={onDrop}
         >
           <div className={`dropzone ${isDragging ? 'active' : ''} ${isConverting ? 'disabled' : ''}`} 
-               onClick={() => !isConverting && fileInputRef.current.click()}>
+               onClick={() => !isConverting && fileInputRef.current?.click()}>
             <div className="upload-icon">
               <Upload />
             </div>
@@ -317,7 +436,7 @@ function App() {
             <div className="queue-actions">
               {!isConverting && (
                 <>
-                  <button className="btn-queue" onClick={() => addMoreInputRef.current.click()}>
+                  <button className="btn-queue" onClick={() => addMoreInputRef.current?.click()}>
                     <Plus size={16} /> Adicionar
                   </button>
                   <button className="btn-queue" onClick={clearSelection}>
@@ -328,10 +447,23 @@ function App() {
                   </button>
                 </>
               )}
-              {isConverting && (
+              {isConverting && !isFinished && (
                 <>
                   <button className="btn-queue" onClick={cancelPending}>Cancelar pendentes</button>
                   <button className="btn-queue" onClick={clearCompleted}>Limpar concluídos</button>
+                  {completed > 0 && (
+                    <button className="btn-queue primary" onClick={downloadZip}>
+                      <Download size={16} style={{marginRight: '6px'}}/> BAIXAR TUDO EM ZIP
+                    </button>
+                  )}
+                </>
+              )}
+              {isConverting && isFinished && (
+                <>
+                  <button className="btn-queue" onClick={clearCompleted}>Limpar concluídos</button>
+                  <button className="btn-queue primary" onClick={addMoreAfterFinish}>
+                    <Plus size={16} style={{marginRight: '6px'}}/> + Converter novos vídeos
+                  </button>
                   {completed > 0 && (
                     <button className="btn-queue primary" onClick={downloadZip}>
                       <Download size={16} style={{marginRight: '6px'}}/> BAIXAR TUDO EM ZIP
@@ -355,6 +487,7 @@ function App() {
                 <div className="gp-stat"><div className="dot waiting"></div>{waiting} aguardando</div>
                 <div className="gp-stat"><div className="dot in-progress"></div>{inProgress} processando</div>
                 <div className="gp-stat"><div className="dot completed"></div>{completed} concluídos</div>
+                {failedCount > 0 && <div className="gp-stat"><div className="dot error"></div>{failedCount} com falha</div>}
               </div>
             </div>
           )}
@@ -403,9 +536,16 @@ function App() {
                         <Download size={16} /> BAIXAR MP4
                       </button>
                     ) : (
-                      <button className="btn-icon-pro" onClick={() => removeFile(f.id)} title="Remover">
-                        <X size={18} />
-                      </button>
+                      <div style={{ display: 'flex', gap: '6px' }}>
+                        {f.status === 'Erro' && (
+                          <button className="btn-icon-pro" onClick={() => retryFile(f.id)} title="Tentar novamente">
+                            <RotateCcw size={18} />
+                          </button>
+                        )}
+                        <button className="btn-icon-pro" onClick={() => removeFile(f.id)} title="Remover">
+                          <X size={18} />
+                        </button>
+                      </div>
                     )}
                   </div>
                 </div>
