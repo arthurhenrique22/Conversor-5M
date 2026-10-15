@@ -110,9 +110,9 @@ function App() {
         if (!Array.isArray(batchState)) return;
 
         setFiles(prev => prev.map(f => {
-          const bState = batchState.find(b => (f.jobId && b.jobId === f.jobId) || b.originalName === f.name);
+          const bState = batchState.find(b => (b.clientFileId && b.clientFileId === f.id) || (f.jobId && b.jobId === f.jobId) || b.originalName === f.name);
           if (bState) {
-            if (f.status === 'Enviando' || f.status === 'Pendente') return f;
+            if (f.status === 'Pendente') return f;
             return {
               ...f,
               jobId: bState.jobId || f.jobId,
@@ -161,6 +161,7 @@ function App() {
     pendingFiles.forEach(async (fileItem) => {
       const formData = new FormData();
       formData.append('video', fileItem.file);
+      formData.append('clientFileId', fileItem.id);
 
       try {
         const response = await fetch(`${API_URL}/api/upload/${currentBatchId}`, {
@@ -175,9 +176,16 @@ function App() {
         }
 
         const data = await response.json();
-        setFiles(prev => prev.map(f => 
-          f.id === fileItem.id ? { ...f, jobId: data.jobId, status: 'Aguardando', progress: 0 } : f
-        ));
+        setFiles(prev => prev.map(f => {
+          if (f.id !== fileItem.id) return f;
+          const isAdvanced = ['Analisando vídeo', 'Convertendo', 'Concluído'].includes(f.status);
+          return {
+            ...f,
+            jobId: data.jobId,
+            status: isAdvanced ? f.status : 'Aguardando',
+            progress: isAdvanced ? f.progress : 0
+          };
+        }));
       } catch (error) {
         console.error(`[Upload] Falha ao enviar vídeo ${fileItem.name}:`, error);
         setFiles(prev => prev.map(f => 

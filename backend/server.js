@@ -109,22 +109,40 @@ app.get('/health', (req, res) => {
 });
 
 // Upload atrelado a um lote
-app.post('/api/upload/:batchId', checkStorageLimit, upload.single('video'), async (req, res) => {
+app.post('/api/upload/:batchId', (req, res, next) => {
+    console.log(`[UPLOAD] Requisição iniciada - Lote: ${req.params.batchId}`);
+    next();
+}, checkStorageLimit, upload.single('video'), async (req, res) => {
+    const batchId = req.params.batchId;
+    console.log(`[UPLOAD] Recebimento concluído no servidor - Lote: ${batchId}`);
+    
     if (!req.file) {
+        console.warn(`[UPLOAD] Falha de validação: nenhum arquivo recebido ou formato inválido - Lote: ${batchId}`);
         return res.status(400).json({ error: 'Nenhum arquivo enviado ou formato inválido. Use um arquivo MOV.' });
     }
 
-    const batchId = req.params.batchId;
     const sessionId = req.sessionId;
     const actualJobId = path.parse(req.file.filename).name; 
+    const clientFileId = req.body.clientFileId || null;
+    const fileSizeMB = (req.file.size / (1024 * 1024)).toFixed(2);
+    
+    console.log(`[UPLOAD] Arquivo salvo temporariamente - Lote: ${batchId}, Job: ${actualJobId}, Arquivo: ${req.file.originalname}, Tamanho: ${fileSizeMB} MB`);
     
     try {
-        await startConversion(batchId, sessionId, req.file.path, req.file.originalname, actualJobId);
-        res.json({ jobId: actualJobId, batchId: batchId, originalName: req.file.originalname, message: 'Adicionado à fila' });
+        await startConversion(batchId, sessionId, req.file.path, req.file.originalname, actualJobId, clientFileId);
+        console.log(`[JOB] Job registrado e enfileirado com sucesso - Lote: ${batchId}, Job: ${actualJobId}`);
+        res.json({ 
+            jobId: actualJobId, 
+            clientFileId: clientFileId,
+            batchId: batchId, 
+            originalName: req.file.originalname, 
+            message: 'Adicionado à fila' 
+        });
     } catch (error) {
-        console.error('Erro ao iniciar conversão:', error);
-        // Se der erro (ex: limite de tarefas globais)
-        if (fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
+        console.error(`[JOB] Erro ao iniciar conversão - Lote: ${batchId}, Job: ${actualJobId}:`, error.message || error);
+        if (fs.existsSync(req.file.path)) {
+            try { fs.unlinkSync(req.file.path); } catch (_) {}
+        }
         res.status(error.status || 500).json({ error: error.message || 'Falha ao processar o vídeo.' });
     }
 });
