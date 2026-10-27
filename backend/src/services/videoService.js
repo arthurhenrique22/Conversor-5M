@@ -5,7 +5,6 @@ const path = require('path');
 const fs = require('fs');
 const async = require('async');
 const { ZipArchive } = require('archiver');
-const { MAX_GLOBAL_QUEUE, MAX_USER_ACTIVE_JOBS } = require('../utils/systemLimits');
 
 // Set static paths explicitly
 ffmpeg.setFfmpegPath(ffmpegStatic);
@@ -14,74 +13,53 @@ ffmpeg.setFfprobePath(ffprobeStatic.path);
 console.log('[FFMPEG] ffmpeg path:', ffmpegStatic);
 console.log('[FFMPEG] ffprobe path:', ffprobeStatic.path);
 
-// Garantir permissão de execução nos binários para contêineres Linux (Railway)
-try {
-    if (fs.existsSync(ffmpegStatic)) {
-        fs.chmodSync(ffmpegStatic, 0o755);
-    }
-} catch (e) {
-    console.warn('[FFMPEG] Permissão ffmpeg:', e.message);
-}
-try {
-    if (fs.existsSync(ffprobeStatic.path)) {
-        fs.chmodSync(ffprobeStatic.path, 0o755);
-    }
-} catch (e) {
-    console.warn('[FFPROBE] Permissão ffprobe:', e.message);
-}
-
 if (process.env.FFMPEG_PATH) ffmpeg.setFfmpegPath(process.env.FFMPEG_PATH);
 if (process.env.FFPROBE_PATH) ffmpeg.setFfprobePath(process.env.FFPROBE_PATH);
 
 // Controle de Concorrência: limite padrão de 2 conversoes simultâneas
-const MAX_CONCURRENT_CONVERSIONS = process.env.MAX_CONCURRENT_CONVERSIONS ? parseInt(process.env.MAX_CONCURRENT_CONVERSIONS) : 2;
+const MAX_CONCURRENT_CONVERSIONS = process.env.MAX_CONCURRENT_CONVERSIONS ? parseInt(process.env.MAX_CONCURRENT_CONVERSIONS, 10) : 2;
 
-// Armazenamento
+// Armazenamento em memória
 // clients[batchId] = Set<Response>
 const batchClients = new Map();
 
-// batches[batchId] = { sessionId, jobs: Map<jobId, stateObject> }
+// batches[batchId] = Map<jobId, stateObject>
 const batches = new Map();
 
 // ffmpegCommands[jobId] = command (para cancelamento)
 const ffmpegCommands = new Map();
 
-const analyzeVideo = (filePath, jobId) => {
+// Converte timemark (HH:MM:SS.microsegundos) para microssegundos inteiros
+const parseTimemarkToMicroseconds = (timemark) => {
+    if (!timemark || typeof timemark !== 'string') return 0;
+    const parts = timemark.split(':');
+    if (parts.length === 3) {
+        const hours = parseFloat(parts[0]) || 0;
+        const minutes = parseFloat(parts[1]) || 0;
+        const seconds = parseFloat(parts[2]) || 0;
+        return Math.round(((hours * 3600) + (minutes * 60) + seconds) * 1_000_000);
+    }
+    return 0;
+};
+
+const getDuration = (filePath) => {
     return new Promise((resolve, reject) => {
-        console.log(`[FFPROBE] Análise iniciada - Job: ${jobId}, Arquivo: ${filePath}`);
-        let finished = false;
-        const timer = setTimeout(() => {
-            if (!finished) {
-                finished = true;
-                console.warn(`[FFPROBE] Timeout (15s) excedido na análise do job ${jobId}`);
-                reject(new Error('Timeout ao analisar metadados do vídeo.'));
-            }
-        }, 15000);
+        const timeout = setTimeout(() => {
+            reject(new Error('Timeout de 30s ao analisar metadados com ffprobe.'));
+        }, 30000);
 
         ffmpeg.ffprobe(filePath, (err, metadata) => {
-            if (finished) return;
-            finished = true;
-            clearTimeout(timer);
+            clearTimeout(timeout);
+            if (err) return reject(err);
 
-            if (err) {
-                console.error(`[FFPROBE] Erro na análise - Job: ${jobId}:`, err.message || err);
-                return reject(err);
+            let duration = metadata?.format?.duration;
+            if (!duration && metadata?.streams) {
+                const videoStream = metadata.streams.find(s => s.codec_type === 'video');
+                duration = videoStream?.duration;
             }
 
-            try {
-                const streams = metadata && metadata.streams ? metadata.streams : [];
-                const videoStream = streams.find(s => s.codec_type === 'video');
-                const audioStream = streams.find(s => s.codec_type === 'audio');
-                const duration = metadata && metadata.format && metadata.format.duration ? parseFloat(metadata.format.duration) : null;
-                const videoCodec = videoStream ? videoStream.codec_name : null;
-                const audioCodec = audioStream ? audioStream.codec_name : null;
-
-                console.log(`[FFPROBE] Análise concluída - Job: ${jobId}, Duração: ${duration}s, VideoCodec: ${videoCodec}, AudioCodec: ${audioCodec}`);
-                resolve({ duration, videoCodec, audioCodec });
-            } catch (parseErr) {
-                console.error(`[FFPROBE] Erro ao interpretar metadados do job ${jobId}:`, parseErr);
-                reject(parseErr);
-            }
+            const parsed = duration ? parseFloat(duration) : null;
+            resolve(parsed && Number.isFinite(parsed) && parsed > 0 ? parsed : null);
         });
     });
 };
@@ -90,23 +68,27 @@ const notifyBatchClients = (batchId) => {
     const clients = batchClients.get(batchId);
     if (!clients || clients.size === 0) return;
     
-    const batchData = batches.get(batchId);
-    if (!batchData) return;
+    const batchJobs = batches.get(batchId);
+    if (!batchJobs) return;
     
     // Converte os Map values para array serializável
-    const batchState = Array.from(batchData.jobs.values());
+    const batchState = Array.from(batchJobs.values());
     const message = `data: ${JSON.stringify(batchState)}\n\n`;
     
     clients.forEach(res => {
-        res.write(message);
+        try {
+            res.write(message);
+        } catch (err) {
+            console.error(`[${new Date().toISOString()}] [SSE] Falha ao enviar evento para cliente:`, err.message);
+        }
     });
 };
 
 const updateJobState = (batchId, jobId, stateUpdates) => {
-    const batchData = batches.get(batchId);
-    if (!batchData) return;
-    
-    const batchJobs = batchData.jobs;
+    if (!batches.has(batchId)) {
+        batches.set(batchId, new Map());
+    }
+    const batchJobs = batches.get(batchId);
     const currentState = batchJobs.get(jobId) || { jobId, batchId, progress: 0 };
     batchJobs.set(jobId, { ...currentState, ...stateUpdates });
     
@@ -115,195 +97,175 @@ const updateJobState = (batchId, jobId, stateUpdates) => {
 
 // A fila que processa os ffmpegs com controle de concorrência
 const conversionQueue = async.queue(async (task) => {
-    const { batchId, jobId, clientFileId, inputPath, originalName, outputPath } = task;
-    console.log(`[QUEUE] Job iniciado - Lote: ${batchId}, Job: ${jobId}, Arquivo: ${originalName}`);
+    const { batchId, jobId, inputPath, originalName, outputPath } = task;
+    const taskStartTime = Date.now();
     
+    console.log(`[${new Date().toISOString()}] [FILA PROCESSANDO] Início da conversão | Job: ${jobId} | Lote: ${batchId} | Arquivo: "${originalName}" | Restantes na fila: ${conversionQueue.length()}`);
+
     // Antes de iniciar, verifica se o job não foi cancelado/deletado enquanto aguardava
-    const batchData = batches.get(batchId);
-    if (!batchData || !batchData.jobs.has(jobId)) {
-        console.log(`[QUEUE] Job ignorado pois foi cancelado ou removido - Job: ${jobId}`);
-        return; // Job cancelado
+    const batchJobs = batches.get(batchId);
+    if (!batchJobs || !batchJobs.has(jobId)) {
+        console.log(`[${new Date().toISOString()}] [FILA PULANDO] Job ${jobId} cancelado antes do início.`);
+        return;
     }
     
-    const currentState = batchData.jobs.get(jobId);
+    const currentState = batchJobs.get(jobId);
     if (currentState && currentState.status === 'Cancelado') {
-        console.log(`[QUEUE] Job já cancelado - Job: ${jobId}`);
+        console.log(`[${new Date().toISOString()}] [FILA PULANDO] Job ${jobId} marcado como Cancelado.`);
         return;
     }
     
-    updateJobState(batchId, jobId, { status: 'Analisando vídeo', progress: 0 });
+    updateJobState(batchId, jobId, { 
+        status: 'Analisando vídeo', 
+        progress: 0,
+        startTime: taskStartTime
+    });
 
-    let analysis = { duration: null, videoCodec: null, audioCodec: null };
+    let duration = null;
     try {
-        analysis = await analyzeVideo(inputPath, jobId);
+        console.log(`[${new Date().toISOString()}] [FFPROBE INÍCIO] Analisando metadados: ${inputPath}`);
+        duration = await getDuration(inputPath);
+        console.log(`[${new Date().toISOString()}] [FFPROBE FIM] Metadados analisados com sucesso | Duração: ${duration ? duration.toFixed(2) + 's' : 'Desconhecida'}`);
     } catch (err) {
-        console.error(`[JOB] Falha no FFprobe para o job ${jobId}:`, err.message || err);
-        updateJobState(batchId, jobId, { status: 'Erro', error: 'Não foi possível analisar este vídeo.', progress: 0 });
-        if (fs.existsSync(inputPath)) {
-            try { fs.unlinkSync(inputPath); } catch (_) {}
-        }
+        console.error(`[${new Date().toISOString()}] [FFPROBE ERRO] Falha no job ${jobId}:`, err.message);
+        updateJobState(batchId, jobId, { 
+            status: 'Erro', 
+            error: 'Não foi possível analisar o arquivo MOV enviado.', 
+            progress: 0 
+        });
         return;
     }
 
-    const { duration, videoCodec, audioCodec } = analysis;
-    updateJobState(batchId, jobId, { status: 'Convertendo', progress: 5 });
+    updateJobState(batchId, jobId, { 
+        status: 'Convertendo', 
+        progress: 0,
+        totalDuration: duration
+    });
+    
+    console.log(`[${new Date().toISOString()}] [FFMPEG INÍCIO] Transcodificação iniciada -> ${outputPath} | Codec: libx264/aac | Preset: fast`);
+
+    let lastLoggedPercent = -1;
+    let lastLogTime = Date.now();
 
     return new Promise((resolve) => {
-        let isResolved = false;
-        const finish = () => {
-            if (!isResolved) {
-                isResolved = true;
-                clearTimeout(timeoutTimer);
-                ffmpegCommands.delete(jobId);
-                resolve();
-            }
-        };
-
-        // Timeout de proteção para não travar a fila (10 minutos)
-        const timeoutTimer = setTimeout(() => {
-            console.error(`[FFMPEG] Timeout de conversão atingido (10m) - Job: ${jobId}`);
-            const cmd = ffmpegCommands.get(jobId);
-            if (cmd) {
-                try { cmd.kill('SIGKILL'); } catch (_) {}
-            }
-            updateJobState(batchId, jobId, { status: 'Erro', error: 'Tempo limite de conversão excedido.', progress: 0 });
-            finish();
-        }, 10 * 60 * 1000);
-
-        console.log(`[FFMPEG] Processo iniciado - Lote: ${batchId}, Job: ${jobId}, VideoCodec: ${videoCodec || 'auto'}, AudioCodec: ${audioCodec || 'auto'}`);
-
-        let command = ffmpeg(inputPath)
+        const command = ffmpeg(inputPath)
             .output(outputPath)
+            .videoCodec('libx264')
+            .audioCodec('aac')
             .outputOptions([
-                '-y',                  // Sobrescreve sem perguntar
-                '-nostdin',            // Desativa stdin completamente
-                '-movflags +faststart' // Carregamento rápido para streaming web
-            ]);
+                '-movflags +faststart',
+                '-preset fast',
+                '-crf 23'
+            ])
+            .on('progress', (progressInfo) => {
+                let percent = 0;
+                let currentVideoSec = 0;
 
-        const isDirectCopy = videoCodec === 'h264' || videoCodec === 'hevc';
-
-        if (videoCodec === 'h264') {
-            command = command.videoCodec('copy');
-        } else if (videoCodec === 'hevc') {
-            command = command.videoCodec('copy').outputOptions(['-tag:v hvc1']);
-        } else {
-            command = command.videoCodec('libx264')
-                             .outputOptions(['-preset veryfast', '-crf 23']);
-        }
-
-        if (audioCodec === 'aac') {
-            command = command.audioCodec('copy');
-        } else {
-            command = command.audioCodec('aac');
-        }
-
-        // Se for cópia direta (muito rápida), simula um progresso inicial visível
-        if (isDirectCopy) {
-            updateJobState(batchId, jobId, { status: 'Convertendo', progress: 50 });
-        }
-
-        command.on('progress', (progressInfo) => {
-            let percent = 0;
-            if (progressInfo.percent) {
-                percent = progressInfo.percent;
-            } else if (progressInfo.timemark && duration) {
-                const a = progressInfo.timemark.split(':');
-                const seconds = (+a[0]) * 60 * 60 + (+a[1]) * 60 + (+a[2]);
-                percent = (seconds / duration) * 100;
-            }
-            percent = Math.min(Math.max(percent, 5), 99);
-            updateJobState(batchId, jobId, { status: 'Convertendo', progress: percent.toFixed(1) });
-        })
-        .on('end', () => {
-            console.log(`[FFMPEG] Processo finalizado com sucesso - Job: ${jobId}`);
-            try {
-                const originalStat = fs.statSync(inputPath);
-                const finalStat = fs.statSync(outputPath);
-                
-                updateJobState(batchId, jobId, { 
-                    status: 'Concluído', 
-                    progress: 100,
-                    originalSize: originalStat.size,
-                    finalSize: finalStat.size,
-                    duration: duration
-                });
-                console.log(`[JOB] Conversão concluída - Job: ${jobId}, Tamanho final: ${(finalStat.size / (1024*1024)).toFixed(2)} MB`);
-            } catch(e) {
-                console.error(`[JOB] Erro ao validar arquivo final gerado - Job: ${jobId}:`, e);
-                updateJobState(batchId, jobId, { status: 'Erro', error: 'Falha ao processar arquivo final.', progress: 0 });
-            } finally {
-                if (fs.existsSync(inputPath)) {
-                    try { fs.unlinkSync(inputPath); } catch (_) {}
+                // Cálculo preciso baseado na fórmula: percentual = out_time_us / (duracaoEmSegundos * 1_000_000) * 100
+                if (progressInfo.timemark && duration && duration > 0) {
+                    const outTimeUs = parseTimemarkToMicroseconds(progressInfo.timemark);
+                    const totalDurationUs = duration * 1_000_000;
+                    percent = (outTimeUs / totalDurationUs) * 100;
+                    currentVideoSec = (outTimeUs / 1_000_000).toFixed(1);
+                } else if (progressInfo.percent) {
+                    percent = progressInfo.percent;
                 }
-                finish();
-            }
-        })
-        .on('error', (err, stdout, stderr) => {
-            if (err.message && err.message.includes('SIGKILL')) {
-                console.log(`[FFMPEG] Processo cancelado pelo usuário - Job: ${jobId}`);
-                updateJobState(batchId, jobId, { status: 'Cancelado', progress: 0 });
-            } else {
-                console.error(`[FFMPEG] Erro na conversão - Job: ${jobId}:`, err.message || err);
-                if (stderr) console.error(`[FFMPEG Stderr] Job ${jobId}:`, stderr);
-                updateJobState(batchId, jobId, { status: 'Erro', error: 'Ocorreu um erro durante a conversão.', progress: 0 });
-            }
-            
-            if (fs.existsSync(outputPath)) {
-                try { fs.unlinkSync(outputPath); } catch (_) {}
-            }
-            if (fs.existsSync(inputPath)) {
-                try { fs.unlinkSync(inputPath); } catch (_) {}
-            }
-            finish();
-        });
+
+                if (isNaN(percent) || !Number.isFinite(percent) || percent < 0) {
+                    percent = 0;
+                }
+                // Limita a 99% durante a execução ativa; 100% é reservado exclusivamente para Concluído
+                percent = Math.min(percent, 99.0);
+
+                const elapsedSeconds = ((Date.now() - taskStartTime) / 1000).toFixed(1);
+                const currentPercentInt = Math.floor(percent);
+                const now = Date.now();
+
+                if (currentPercentInt >= lastLoggedPercent + 10 || (now - lastLogTime > 5000 && currentPercentInt > lastLoggedPercent)) {
+                    lastLoggedPercent = currentPercentInt;
+                    lastLogTime = now;
+                    const memMb = (process.memoryUsage().rss / (1024 * 1024)).toFixed(1);
+                    console.log(`[${new Date().toISOString()}] [FFMPEG PROGRESSO] Job: ${jobId} | ${percent.toFixed(1)}% | Timemark: ${progressInfo.timemark || 'N/A'} | Decorrido: ${elapsedSeconds}s | RAM RSS: ${memMb} MB`);
+                }
+
+                updateJobState(batchId, jobId, { 
+                    status: 'Convertendo', 
+                    progress: parseFloat(percent.toFixed(1)),
+                    timemark: progressInfo.timemark || null,
+                    currentTime: currentVideoSec,
+                    elapsedSeconds: parseFloat(elapsedSeconds)
+                });
+            })
+            .on('end', () => {
+                // Etapa "Finalizando arquivo": o FFmpeg concluiu a transcodificação e o arquivo está sendo fechado em disco
+                const elapsedBeforeCheck = ((Date.now() - taskStartTime) / 1000).toFixed(1);
+                updateJobState(batchId, jobId, { 
+                    status: 'Finalizando arquivo', 
+                    progress: 99.5,
+                    elapsedSeconds: parseFloat(elapsedBeforeCheck)
+                });
+
+                try {
+                    const originalStat = fs.statSync(inputPath);
+                    const finalStat = fs.statSync(outputPath);
+                    const elapsed = ((Date.now() - taskStartTime) / 1000).toFixed(1);
+                    const originalMb = (originalStat.size / (1024 * 1024)).toFixed(2);
+                    const finalMb = (finalStat.size / (1024 * 1024)).toFixed(2);
+                    const savedPercent = originalStat.size > 0 
+                        ? (((originalStat.size - finalStat.size) / originalStat.size) * 100).toFixed(1)
+                        : '0';
+
+                    console.log(`[${new Date().toISOString()}] [FFMPEG CONCLUÍDO] Job: ${jobId} em ${elapsed}s | Original: ${originalMb} MB -> MP4: ${finalMb} MB (${savedPercent}% comprimido)`);
+
+                    // Concluído com sucesso: arquivo 100% pronto para download
+                    updateJobState(batchId, jobId, { 
+                        status: 'Concluído', 
+                        progress: 100,
+                        originalSize: originalStat.size,
+                        finalSize: finalStat.size,
+                        duration: duration,
+                        elapsedSeconds: parseFloat(elapsed)
+                    });
+                } catch(e) {
+                    console.error(`[${new Date().toISOString()}] [FFMPEG ERRO PÓS-PROCESSAMENTO] Job: ${jobId}:`, e.message);
+                    updateJobState(batchId, jobId, { 
+                        status: 'Erro', 
+                        error: 'Falha ao validar o arquivo final convertido.', 
+                        progress: 0 
+                    });
+                } finally {
+                    ffmpegCommands.delete(jobId);
+                    resolve();
+                }
+            })
+            .on('error', (err, stdout, stderr) => {
+                if (err.message && err.message.includes('SIGKILL')) {
+                    console.log(`[${new Date().toISOString()}] [FFMPEG CANCELADO] Job: ${jobId} interrompido por solicitação do usuário.`);
+                    updateJobState(batchId, jobId, { status: 'Cancelado', progress: 0 });
+                } else {
+                    console.error(`[${new Date().toISOString()}] [FFMPEG ERRO DE CONVERSÃO] Job: ${jobId}:`, err.message);
+                    updateJobState(batchId, jobId, { status: 'Erro', error: 'Ocorreu um erro durante a conversão do vídeo.', progress: 0 });
+                }
+                
+                ffmpegCommands.delete(jobId);
+                if (fs.existsSync(outputPath)) {
+                    try { fs.unlinkSync(outputPath); } catch (_) {}
+                }
+                resolve();
+            });
 
         ffmpegCommands.set(jobId, command);
-        try {
-            command.run();
-        } catch (runErr) {
-            console.error(`[FFMPEG] Erro síncrono ao chamar command.run() - Job: ${jobId}:`, runErr);
-            updateJobState(batchId, jobId, { status: 'Erro', error: 'Falha ao iniciar processo FFmpeg.', progress: 0 });
-            finish();
-        }
+        command.run();
     });
 }, MAX_CONCURRENT_CONVERSIONS);
 
-const startConversion = async (batchId, sessionId, inputPath, originalName, jobId, clientFileId = null) => {
-    // Verificar limites globais
-    if (conversionQueue.length() + conversionQueue.running() >= MAX_GLOBAL_QUEUE) {
-        console.warn(`[QUEUE] Limite global de fila atingido (${MAX_GLOBAL_QUEUE}) - Lote: ${batchId}`);
-        throw { status: 503, message: 'Fila do servidor cheia. Tente mais tarde.' };
-    }
-
-    if (!batches.has(batchId)) {
-        console.log(`[BATCH] Novo lote registrado - Lote: ${batchId}`);
-        batches.set(batchId, { sessionId: sessionId || null, createdAt: Date.now(), jobs: new Map() });
-    } else {
-        console.log(`[BATCH] Lote localizado - Lote: ${batchId}`);
-    }
-
-    const batchData = batches.get(batchId);
-
-    // Contar jobs ativos no lote para evitar spam excessivo
-    let activeBatchJobs = 0;
-    for (const jState of batchData.jobs.values()) {
-        if (['Aguardando', 'Analisando vídeo', 'Convertendo', 'Pendente', 'Enviando'].includes(jState.status)) {
-            activeBatchJobs++;
-        }
-    }
-
-    if (activeBatchJobs >= MAX_USER_ACTIVE_JOBS) {
-        console.warn(`[BATCH] Limite de jobs por lote atingido (${MAX_USER_ACTIVE_JOBS}) - Lote: ${batchId}`);
-        throw { status: 429, message: `Limite de ${MAX_USER_ACTIVE_JOBS} vídeos simultâneos por lote atingido.` };
-    }
-
+const startConversion = async (batchId, inputPath, originalName, jobId) => {
     const outputPath = path.join(path.dirname(inputPath), `${jobId}.mp4`);
     
-    // Inicializa o estado
-    batchData.jobs.set(jobId, { 
-        jobId, 
-        clientFileId,
-        batchId,
+    console.log(`[${new Date().toISOString()}] [FILA ENFILEIRANDO] Lote: ${batchId} | Job: ${jobId} | Arquivo: "${originalName}"`);
+
+    // Inicializa o estado como "Aguardando" na fila
+    updateJobState(batchId, jobId, { 
         status: 'Aguardando', 
         progress: 0, 
         originalName,
@@ -311,34 +273,31 @@ const startConversion = async (batchId, sessionId, inputPath, originalName, jobI
         outputPath
     });
 
-    console.log(`[JOB] Job criado - Lote: ${batchId}, Job: ${jobId}, Arquivo: ${originalName}`);
-    notifyBatchClients(batchId);
-
     // Envia para a fila
-    console.log(`[QUEUE] Job adicionado à fila - Lote: ${batchId}, Job: ${jobId}`);
-    conversionQueue.push({ batchId, jobId, clientFileId, inputPath, originalName, outputPath });
+    conversionQueue.push({ batchId, jobId, inputPath, originalName, outputPath });
     
     return jobId;
 };
 
-const cancelConversion = (batchId, jobId, sessionId) => {
-    const batchData = batches.get(batchId);
-    if (!batchData || !batchData.jobs.has(jobId)) return false;
+const cancelConversion = (batchId, jobId) => {
+    console.log(`[${new Date().toISOString()}] [CANCELAMENTO SOLICITADO] Lote: ${batchId} | Job: ${jobId}`);
+    const batchJobs = batches.get(batchId);
+    if (!batchJobs || !batchJobs.has(jobId)) return false;
     
-    const jobState = batchData.jobs.get(jobId);
+    const jobState = batchJobs.get(jobId);
     
     // Se está na fila e não começou, apenas marcamos cancelado para pular
     if (jobState.status === 'Aguardando') {
         updateJobState(batchId, jobId, { status: 'Cancelado' });
-        // Limpar o temporário original
         if (fs.existsSync(jobState.inputPath)) {
             try { fs.unlinkSync(jobState.inputPath); } catch (_) {}
         }
+        console.log(`[${new Date().toISOString()}] [CANCELADO NA FILA] Job: ${jobId} cancelado antes do início.`);
         return true;
     }
     
-    // Se está convertendo, encerra o processo FFmpeg
-    if (jobState.status === 'Analisando vídeo' || jobState.status === 'Convertendo') {
+    // Se está convertendo, mata o FFmpeg
+    if (['Analisando vídeo', 'Convertendo', 'Finalizando arquivo'].includes(jobState.status)) {
         const command = ffmpegCommands.get(jobId);
         if (command) {
             command.kill('SIGKILL');
@@ -347,21 +306,41 @@ const cancelConversion = (batchId, jobId, sessionId) => {
         if (fs.existsSync(jobState.inputPath)) {
             try { fs.unlinkSync(jobState.inputPath); } catch (_) {}
         }
+        console.log(`[${new Date().toISOString()}] [CANCELADO EM PROCESSAMENTO] Processo FFmpeg do job ${jobId} encerrado.`);
         return true;
     }
     
     return false;
 };
 
+// Endpoint REST para consulta imediata de status do lote (sincronização instantânea ao voltar à aba)
+const getBatchStatus = (req, res) => {
+    const batchId = req.params.batchId;
+    const batchJobs = batches.get(batchId);
+    
+    if (!batchJobs) {
+        return res.status(200).json({ batchId, jobs: [] });
+    }
+    
+    const jobs = Array.from(batchJobs.values());
+    res.status(200).json({ batchId, jobs });
+};
+
 const getBatchProgress = (req, res) => {
     const batchId = req.params.batchId;
-    const batchData = batches.get(batchId);
-    console.log(`[SSE] Cliente conectado ao lote: ${batchId}`);
-
+    const origin = req.headers.origin;
+    
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache, no-transform');
     res.setHeader('Connection', 'keep-alive');
-    res.setHeader('X-Accel-Buffering', 'no');
+    res.setHeader('X-Accel-Buffering', 'no'); // Desativa buffering em Nginx e proxies como Railway
+
+    if (origin) {
+        res.setHeader('Access-Control-Allow-Origin', origin);
+        res.setHeader('Access-Control-Allow-Credentials', 'true');
+        res.setHeader('Vary', 'Origin');
+    }
+
     res.flushHeaders();
 
     if (!batchClients.has(batchId)) {
@@ -370,26 +349,30 @@ const getBatchProgress = (req, res) => {
     const clients = batchClients.get(batchId);
     clients.add(res);
 
+    console.log(`[${new Date().toISOString()}] [SSE CLIENTE CONECTADO] Lote: ${batchId} | Total de clientes no lote: ${clients.size}`);
+
+    // Heartbeat periódico (a cada 25s) para manter a conexão ativa em proxies
+    const heartbeatTimer = setInterval(() => {
+        try {
+            res.write(': heartbeat\n\n');
+        } catch (e) {
+            clearInterval(heartbeatTimer);
+        }
+    }, 25000);
+
     // Envia o estado atual imediatamente
-    if (batchData) {
-        const batchState = Array.from(batchData.jobs.values());
+    const batchJobs = batches.get(batchId);
+    if (batchJobs) {
+        const batchState = Array.from(batchJobs.values());
         res.write(`data: ${JSON.stringify(batchState)}\n\n`);
-        console.log(`[SSE] Evento transmitido (estado inicial) - Lote: ${batchId}, Jobs: ${batchState.length}`);
     } else {
         res.write(`data: []\n\n`);
     }
 
-    // Heartbeat a cada 15 segundos para manter a conexão ativa através de proxies e roteadores
-    const heartbeatTimer = setInterval(() => {
-        if (!res.writableEnded) {
-            res.write(': heartbeat\n\n');
-        }
-    }, 15000);
-
     req.on('close', () => {
         clearInterval(heartbeatTimer);
         clients.delete(res);
-        console.log(`[SSE] Cliente desconectado do lote: ${batchId}`);
+        console.log(`[${new Date().toISOString()}] [SSE CLIENTE DESCONECTADO] Lote: ${batchId} | Restantes: ${clients.size}`);
         if (clients.size === 0) {
             batchClients.delete(batchId);
         }
@@ -397,37 +380,46 @@ const getBatchProgress = (req, res) => {
 };
 
 const downloadFile = (req, res) => {
-    const { batchId, jobId } = req.params;
-    const outputPath = path.join(__dirname, '../../tmp', `${jobId}.mp4`);
+    const jobId = req.params.id;
+    const tmpDir = path.join(__dirname, '../../tmp');
+    const outputPath = path.join(tmpDir, `${jobId}.mp4`);
     
+    console.log(`[${new Date().toISOString()}] [DOWNLOAD ARQUIVO] Solicitado para job: ${jobId}`);
+
     if (fs.existsSync(outputPath)) {
-        const batchData = batches.get(batchId);
-        if (batchData && batchData.jobs.has(jobId)) {
-            const jobState = batchData.jobs.get(jobId);
-            const downloadName = jobState.originalName.replace(/\.mov$/i, '.mp4');
-            console.log(`[DOWNLOAD] Arquivo disponível para download - Job: ${jobId}, Arquivo: ${downloadName}`);
-            return res.download(outputPath, downloadName, (err) => {
-                if (err && !res.headersSent) {
-                    res.status(500).json({ error: 'Erro ao fazer download do arquivo.' });
-                }
-            });
+        let downloadName = `${jobId}.mp4`;
+        for (const [bId, bJobs] of batches.entries()) {
+            if (bJobs.has(jobId)) {
+                const jobState = bJobs.get(jobId);
+                downloadName = jobState.originalName.replace(/\.mov$/i, '.mp4');
+                break;
+            }
         }
-        return res.status(403).json({ error: 'Acesso negado ou lote inválido.' });
+            
+        res.download(outputPath, downloadName, (err) => {
+            if (err && !res.headersSent) {
+                console.error(`[${new Date().toISOString()}] [DOWNLOAD ERRO] Job: ${jobId}:`, err.message);
+                res.status(500).json({ error: 'Erro ao fazer download do arquivo.' });
+            }
+        });
     } else {
-        res.status(404).json({ error: 'O arquivo expirou ou não existe.' });
+        console.warn(`[${new Date().toISOString()}] [DOWNLOAD NÃO ENCONTRADO] Arquivo não existe em: ${outputPath}`);
+        res.status(404).json({ error: 'O arquivo expirou ou não existe no servidor.' });
     }
 };
 
 const downloadZip = (req, res) => {
     const batchId = req.params.batchId;
-    const batchData = batches.get(batchId);
+    const batchJobs = batches.get(batchId);
     
-    if (!batchData) {
-        return res.status(404).json({ error: 'Lote não encontrado ou expirado.' });
+    console.log(`[${new Date().toISOString()}] [DOWNLOAD ZIP] Solicitado para lote: ${batchId}`);
+
+    if (!batchJobs) {
+        return res.status(404).json({ error: 'Lote não encontrado.' });
     }
 
     const filesToZip = [];
-    for (const jobState of batchData.jobs.values()) {
+    for (const jobState of batchJobs.values()) {
         if (jobState.status === 'Concluído' && fs.existsSync(jobState.outputPath)) {
             filesToZip.push({
                 path: jobState.outputPath,
@@ -444,10 +436,11 @@ const downloadZip = (req, res) => {
     res.setHeader('Content-Disposition', `attachment; filename="Conversor5M-${batchId}.zip"`);
 
     const archive = new ZipArchive({
-        zlib: { level: 0 } // Level 0 para ser rápido, vídeo já é comprimido
+        zlib: { level: 0 }
     });
 
     archive.on('error', (err) => {
+        console.error(`[${new Date().toISOString()}] [DOWNLOAD ZIP ERRO]:`, err.message);
         if (!res.headersSent) res.status(500).json({ error: 'Erro gerando ZIP' });
     });
 
@@ -460,4 +453,14 @@ const downloadZip = (req, res) => {
     archive.finalize();
 };
 
-module.exports = { startConversion, cancelConversion, getBatchProgress, downloadFile, downloadZip, batches, batchClients, ffmpegCommands };
+module.exports = { 
+    startConversion, 
+    cancelConversion, 
+    getBatchProgress, 
+    getBatchStatus,
+    downloadFile, 
+    downloadZip, 
+    batches, 
+    batchClients, 
+    ffmpegCommands 
+};

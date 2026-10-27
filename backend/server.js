@@ -1,97 +1,97 @@
-const path = require('path');
-require('dotenv').config({ path: path.join(__dirname, '.env') });
+require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
+const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
-const cookieParser = require('cookie-parser');
 
 const { upload } = require('./src/middlewares/upload');
-const { checkStorageLimit } = require('./src/utils/systemLimits');
-const { startConversion, cancelConversion, getBatchProgress, downloadFile, downloadZip } = require('./src/services/videoService');
+const { startConversion, cancelConversion, getBatchProgress, getBatchStatus, downloadFile, downloadZip } = require('./src/services/videoService');
 const { startCleanupCron } = require('./src/utils/cleanup');
 
 const app = express();
-const PORT = process.env.PORT || 3005;
+const PORT = process.env.PORT || 3000;
 
+// Configurar trust proxy para proxies reversos (Railway, Cloudflare, Netlify)
+app.set('trust proxy', 1);
+
+// Lista explícita de origens permitidas
+const DEFAULT_ALLOWED_ORIGINS = [
+    'https://conversordos5m.netlify.app',
+    'http://localhost:5173',
+    'http://localhost:3000',
+    'http://127.0.0.1:5173',
+    'http://127.0.0.1:3000'
+];
+
+const getOriginList = () => {
+    const envOrigins = [
+        process.env.FRONTEND_URL,
+        process.env.ALLOWED_ORIGINS
+    ].filter(Boolean).flatMap(val => val.split(','));
+
+    const all = [...DEFAULT_ALLOWED_ORIGINS, ...envOrigins]
+        .map(o => o.trim().replace(/\/+$/, ''))
+        .filter(Boolean);
+
+    return Array.from(new Set(all));
+};
+
+const allowedOrigins = getOriginList();
+
+const isOriginAllowed = (origin) => {
+    if (!origin) return true; // Requisições locais/sem origin (curl, server-to-server)
+    const normalized = origin.trim().replace(/\/+$/, '');
+    return allowedOrigins.includes(normalized);
+};
+
+// Logging de requisições gerais
 app.use((req, res, next) => {
-    console.log(`[REQUEST] ${req.method} ${req.url}`);
+    console.log(`[${new Date().toISOString()}] [REQUEST] ${req.method} ${req.url} | Origin: ${req.headers.origin || 'N/A'}`);
     next();
 });
 
-// Configuração robusta de CORS
-const allowedOrigins = (process.env.FRONTEND_URL || '')
-    .split(',')
-    .map(url => url.trim().replace(/\/$/, ''))
-    .filter(Boolean);
-
-const isOriginAllowed = (origin) => {
-    if (!origin) return true; // Permite requisições sem origin (curl, mobile, testes internos)
-    const cleanOrigin = origin.replace(/\/$/, '');
-
-    // Permitir explicitamente URLs configuradas no ambiente
-    if (allowedOrigins.includes(cleanOrigin)) return true;
-
-    // Permitir qualquer localhost e 127.0.0.1 em qualquer porta
-    if (/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(cleanOrigin)) {
-        return true;
-    }
-
-    // Permitir qualquer subdomínio do Netlify (*.netlify.app)
-    if (/^https:\/\/[a-zA-Z0-9_.-]+\.netlify\.app$/.test(cleanOrigin)) {
-        return true;
-    }
-
-    // Permitir domínios relacionados ao projeto Conversor 5M
-    if (/^https?:\/\/(www\.)?conversor.*5m.*\.[a-z.]+$/i.test(cleanOrigin)) {
-        return true;
-    }
-
-    return false;
-};
-
+// Configurar CORS
 const corsOptions = {
     origin: (origin, callback) => {
         if (isOriginAllowed(origin)) {
             callback(null, true);
         } else {
-            console.warn(`[CORS Bloqueado] Origem: ${origin}`);
-            callback(new Error('Origem não permitida por CORS'));
+            console.warn(`[${new Date().toISOString()}] [CORS] Origem bloqueada: ${origin}`);
+            callback(new Error(`Origem não permitida por CORS: ${origin}`));
         }
     },
     methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Accept', 'Authorization', 'Range', 'Cache-Control', 'X-Requested-With', 'X-Session-Id'],
-    exposedHeaders: ['Content-Disposition', 'Content-Length', 'X-Session-Id'],
+    allowedHeaders: [
+        'Content-Type',
+        'Authorization',
+        'X-Requested-With',
+        'Accept',
+        'Origin',
+        'Range',
+        'Cache-Control'
+    ],
+    exposedHeaders: [
+        'Content-Disposition',
+        'Content-Length',
+        'Content-Range'
+    ],
     credentials: true,
-    maxAge: 86400,
-    optionsSuccessStatus: 200
+    maxAge: 86400
 };
 
+// Aplicar middleware CORS antes de qualquer rota ou parser
 app.use(cors(corsOptions));
-app.use(express.json());
-app.use(cookieParser());
 
-// Configuração de sessão unificada (Header X-Session-Id, Query param ?sessionId ou Cookie)
+// Garantir resposta rápida com 204 para requisições preflight OPTIONS
 app.use((req, res, next) => {
-    let sessionId = req.headers['x-session-id'] || req.query.sessionId || req.cookies.sessionId;
-    if (!sessionId) {
-        sessionId = crypto.randomUUID();
+    if (req.method === 'OPTIONS') {
+        return res.sendStatus(204);
     }
-    
-    // Em produção com HTTPS deve usar secure: true e sameSite: 'none' se cross-origin, senão 'lax'
-    const isProd = process.env.NODE_ENV === 'production';
-    res.cookie('sessionId', sessionId, { 
-        httpOnly: true, 
-        secure: isProd, 
-        sameSite: isProd ? 'none' : 'lax', 
-        maxAge: 24 * 60 * 60 * 1000 // 24h
-    });
-    
-    // Expõe o sessionId nos headers da resposta
-    res.setHeader('X-Session-Id', sessionId);
-    req.sessionId = sessionId;
     next();
 });
+
+app.use(express.json());
 
 // Garantir que a pasta tmp existe
 const tmpDir = path.join(__dirname, 'tmp');
@@ -102,77 +102,157 @@ if (!fs.existsSync(tmpDir)) {
 // Iniciar cron job de limpeza
 startCleanupCron();
 
+// Middleware para rastrear o progresso do upload da rede SEM consumir o corpo da requisição
+const trackUploadProgress = (req, res, next) => {
+    const contentLength = parseInt(req.headers['content-length'] || '0', 10);
+    const batchId = req.params.batchId || 'unknown';
+    let receivedBytes = 0;
+    let lastLoggedPercent = -1;
+    let lastLogTime = Date.now();
+    const startTime = Date.now();
+
+    console.log(`[${new Date().toISOString()}] [UPLOAD INICIADO] Lote: ${batchId} | Content-Length: ${contentLength} bytes (${(contentLength / (1024 * 1024)).toFixed(2)} MB)`);
+
+    req.on('data', (chunk) => {
+        receivedBytes += chunk.length;
+        const now = Date.now();
+        
+        if (contentLength > 0) {
+            const currentPercent = Math.floor((receivedBytes / contentLength) * 100);
+            if (currentPercent >= lastLoggedPercent + 10 || (now - lastLogTime > 5000 && currentPercent > lastLoggedPercent)) {
+                lastLoggedPercent = currentPercent;
+                lastLogTime = now;
+                const elapsedSec = (now - startTime) / 1000;
+                const speed = elapsedSec > 0 ? (receivedBytes / elapsedSec / (1024 * 1024)).toFixed(2) : '0';
+                const memMb = (process.memoryUsage().rss / (1024 * 1024)).toFixed(1);
+                console.log(`[${new Date().toISOString()}] [UPLOAD RECEBENDO] Lote: ${batchId} | ${currentPercent}% (${(receivedBytes / (1024 * 1024)).toFixed(1)} / ${(contentLength / (1024 * 1024)).toFixed(1)} MB) | Taxa: ${speed} MB/s | RAM: ${memMb} MB`);
+            }
+        }
+    });
+
+    req.on('end', () => {
+        const totalDuration = ((Date.now() - startTime) / 1000).toFixed(2);
+        console.log(`[${new Date().toISOString()}] [UPLOAD REDE CONCLUÍDO] Lote: ${batchId} | Total recebido: ${(receivedBytes / (1024 * 1024)).toFixed(2)} MB em ${totalDuration}s`);
+    });
+
+    req.on('aborted', () => {
+        console.warn(`[${new Date().toISOString()}] [UPLOAD INTERROMPIDO/ABORTADO] Lote: ${batchId} após ${(receivedBytes / (1024 * 1024)).toFixed(2)} MB`);
+    });
+
+    req.on('error', (err) => {
+        console.error(`[${new Date().toISOString()}] [UPLOAD ERRO DE REDE] Lote: ${batchId}:`, err.message);
+    });
+
+    next();
+};
+
 // Rotas da API
 
-app.get('/health', (req, res) => {
-    res.status(200).send('OK');
+// Rota raiz para status e verificação de saúde básica
+app.get('/', (req, res) => {
+    res.status(200).json({
+        status: 'online',
+        service: 'Conversor dos 5M API',
+        version: '1.0.0',
+        timestamp: new Date().toISOString()
+    });
 });
 
-// Upload atrelado a um lote
-app.post('/api/upload/:batchId', (req, res, next) => {
-    console.log(`[UPLOAD] Requisição iniciada - Lote: ${req.params.batchId}`);
-    next();
-}, checkStorageLimit, upload.single('video'), async (req, res) => {
+app.get('/health', (req, res) => {
+    res.status(200).json({
+        status: 'OK',
+        uptime: process.uptime(),
+        memoryRSS: `${(process.memoryUsage().rss / (1024 * 1024)).toFixed(1)} MB`,
+        timestamp: new Date().toISOString()
+    });
+});
+
+// Upload atrelado a um lote (com rastreamento de progresso de stream antes do Multer)
+app.post('/api/upload/:batchId', trackUploadProgress, upload.single('video'), async (req, res) => {
     const batchId = req.params.batchId;
-    console.log(`[UPLOAD] Recebimento concluído no servidor - Lote: ${batchId}`);
-    
+
     if (!req.file) {
-        console.warn(`[UPLOAD] Falha de validação: nenhum arquivo recebido ou formato inválido - Lote: ${batchId}`);
+        console.warn(`[${new Date().toISOString()}] [UPLOAD REJEITADO] Lote: ${batchId} | Nenhum arquivo válido recebido no campo "video".`);
         return res.status(400).json({ error: 'Nenhum arquivo enviado ou formato inválido. Use um arquivo MOV.' });
     }
 
-    const sessionId = req.sessionId;
     const actualJobId = path.parse(req.file.filename).name; 
-    const clientFileId = req.body.clientFileId || null;
-    const fileSizeMB = (req.file.size / (1024 * 1024)).toFixed(2);
+    const fileMb = (req.file.size / (1024 * 1024)).toFixed(2);
     
-    console.log(`[UPLOAD] Arquivo salvo temporariamente - Lote: ${batchId}, Job: ${actualJobId}, Arquivo: ${req.file.originalname}, Tamanho: ${fileSizeMB} MB`);
-    
+    console.log(`[${new Date().toISOString()}] [PARSER MULTIPART FINALIZADO] Lote: ${batchId} | Job: ${actualJobId} | Arquivo: "${req.file.originalname}" (${fileMb} MB) gravado em: ${req.file.path}`);
+
     try {
-        await startConversion(batchId, sessionId, req.file.path, req.file.originalname, actualJobId, clientFileId);
-        console.log(`[JOB] Job registrado e enfileirado com sucesso - Lote: ${batchId}, Job: ${actualJobId}`);
-        res.json({ 
+        await startConversion(batchId, req.file.path, req.file.originalname, actualJobId);
+        
+        console.log(`[${new Date().toISOString()}] [UPLOAD RESPOSTA ENVIADA] Lote: ${batchId} | Job: ${actualJobId} enfileirado com sucesso.`);
+        
+        res.status(200).json({ 
             jobId: actualJobId, 
-            clientFileId: clientFileId,
             batchId: batchId, 
             originalName: req.file.originalname, 
-            message: 'Adicionado à fila' 
+            size: req.file.size,
+            message: 'Arquivo recebido com sucesso e adicionado à fila de conversão' 
         });
     } catch (error) {
-        console.error(`[JOB] Erro ao iniciar conversão - Lote: ${batchId}, Job: ${actualJobId}:`, error.message || error);
-        if (fs.existsSync(req.file.path)) {
-            try { fs.unlinkSync(req.file.path); } catch (_) {}
-        }
-        res.status(error.status || 500).json({ error: error.message || 'Falha ao processar o vídeo.' });
+        console.error(`[${new Date().toISOString()}] [UPLOAD ERRO INICIALIZAÇÃO] Lote: ${batchId}:`, error);
+        res.status(500).json({ error: 'Falha ao processar o vídeo.' });
     }
 });
 
+// Cancelamento de job no lote
 app.post('/api/cancel/:batchId/:jobId', (req, res) => {
     const { batchId, jobId } = req.params;
-    const sessionId = req.sessionId;
-    const cancelled = cancelConversion(batchId, jobId, sessionId);
+    const cancelled = cancelConversion(batchId, jobId);
     if (cancelled) {
         res.json({ success: true, message: 'Processo cancelado' });
     } else {
-        res.status(403).json({ error: 'Processo não encontrado ou não pôde ser cancelado' });
+        res.status(404).json({ error: 'Processo não encontrado ou não pôde ser cancelado' });
     }
 });
 
+// Consulta imediata de status do lote (sincronização REST ao voltar à aba)
+app.get('/api/batch/:batchId/status', getBatchStatus);
+
+// Progresso do lote via Server-Sent Events (SSE)
 app.get('/api/progress/batch/:batchId', getBatchProgress);
 
-app.get('/api/download/:batchId/:jobId', downloadFile);
+// Download de arquivo individual
+app.get('/api/download/:id', downloadFile);
 
+// Download de lote completo em ZIP
 app.get('/api/download/batch/:batchId/zip', downloadZip);
 
-// Error handling middleware (e.g., multer errors)
+// Error handling middleware (com suporte a CORS garantido nas respostas de erro)
 app.use((err, req, res, next) => {
-    if (err) {
-        console.error('Erro na API:', err.message);
-        return res.status(400).json({ error: err.message });
+    const origin = req.headers.origin;
+    if (origin && isOriginAllowed(origin)) {
+        res.setHeader('Access-Control-Allow-Origin', origin);
+        res.setHeader('Access-Control-Allow-Credentials', 'true');
+        res.setHeader('Vary', 'Origin');
     }
-    next();
+
+    console.error(`[${new Date().toISOString()}] [ERRO API]:`, err.message);
+
+    if (err.code === 'LIMIT_FILE_SIZE') {
+        return res.status(413).json({ 
+            error: 'Arquivo muito grande. O limite máximo permitido é de 500MB.' 
+        });
+    }
+
+    const statusCode = err.status || err.statusCode || (err.message && err.message.includes('CORS') ? 403 : 400);
+    return res.status(statusCode).json({ 
+        error: err.message || 'Erro ao processar requisição.' 
+    });
 });
 
-app.listen(PORT, () => {
-    console.log(`Servidor rodando na porta ${PORT}`);
+const server = app.listen(PORT, () => {
+    console.log(`[${new Date().toISOString()}] [Servidor] Rodando na porta ${PORT}`);
+    console.log(`[${new Date().toISOString()}] [CORS] Origens permitidas:`, allowedOrigins);
 });
+
+// Configurar timeouts adequados para uploads grandes (10 minutos)
+server.timeout = 10 * 60 * 1000;
+server.keepAliveTimeout = 65000;
+server.headersTimeout = 66000;
+
+module.exports = { app, server };

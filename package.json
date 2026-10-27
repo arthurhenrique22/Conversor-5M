@@ -1,0 +1,9 @@
+{
+  "name": "conversor-5m",
+  "private": true,
+  "scripts": {
+    "start": "cd backend && npm start",
+    "build": "cd backend && npm install",
+    "postinstall": "cd backend && npm install"
+  }
+}

@@ -104,7 +104,7 @@ body {
 /* Hero Section */
 .hero {
   text-align: center;
-  padding: 4rem 1rem 2rem;
+  padding: 3rem 1rem 1rem;
   max-width: 800px;
   margin: 0 auto;
 }
@@ -118,7 +118,7 @@ body {
   border-radius: 20px;
   font-size: 0.85rem;
   font-weight: 500;
-  margin-bottom: 1.5rem;
+  margin-bottom: 1.25rem;
 }
 
 .hero h1 {
@@ -143,11 +143,18 @@ body {
   margin: 0 auto;
 }
 
+.hero-subtitle {
+  font-size: 0.85rem;
+  margin-top: 0.75rem;
+  color: var(--text-muted);
+  letter-spacing: 0.5px;
+}
+
 /* Main Workspace */
 .workspace {
   position: relative;
   max-width: 1000px;
-  margin: 2rem auto;
+  margin: 1.25rem auto 2.5rem;
   padding: 0 1rem;
   display: flex;
   justify-content: center;
@@ -157,6 +164,7 @@ body {
 /* Lateral Cards */
 .lateral-card {
   position: absolute;
+  top: 50%;
   width: 120px;
   height: 140px;
   background: var(--bg-card);
@@ -168,18 +176,24 @@ body {
   align-items: center;
   gap: 0.5rem;
   box-shadow: 0 10px 30px rgba(0,0,0,0.5);
-  opacity: 0.8;
+  opacity: 0.85;
   z-index: 1;
+  transition: transform 0.3s ease, opacity 0.3s ease;
 }
 
 .lateral-card.left {
-  left: 0;
-  transform: rotate(-10deg) translateY(20px);
+  left: 20px;
+  transform: translateY(-50%) rotate(-8deg);
 }
 
 .lateral-card.right {
-  right: 0;
-  transform: rotate(10deg) translateY(20px);
+  right: 20px;
+  transform: translateY(-50%) rotate(8deg);
+}
+
+.lateral-card:hover {
+  opacity: 1;
+  transform: translateY(-50%) rotate(0deg) scale(1.04);
 }
 
 .lateral-card .icon {
@@ -209,7 +223,7 @@ body {
 .dropzone {
   border: 2px dashed rgba(59, 130, 246, 0.5);
   border-radius: 12px;
-  padding: 4rem 2rem;
+  padding: 3.25rem 2rem;
   text-align: center;
   transition: all 0.2s;
   cursor: pointer;
@@ -353,42 +367,59 @@ body {
   margin-bottom: 1.5rem;
 }
 
+.gp-section {
+  display: flex;
+  flex-direction: column;
+}
+
 .gp-header {
   display: flex;
   justify-content: space-between;
-  margin-bottom: 0.75rem;
+  align-items: center;
+  margin-bottom: 0.5rem;
 }
 
 .gp-title {
   font-weight: 500;
   font-size: 0.95rem;
+  color: var(--text-main);
 }
 
 .gp-percentage {
   font-weight: 600;
+  font-size: 0.9rem;
   color: var(--accent);
+  font-variant-numeric: tabular-nums;
 }
 
 .gp-track {
   width: 100%;
   height: 6px;
-  background: rgba(255,255,255,0.05);
+  background: rgba(255,255,255,0.06);
   border-radius: 3px;
   overflow: hidden;
-  margin-bottom: 0.75rem;
 }
 
 .gp-fill {
   height: 100%;
   background: linear-gradient(90deg, var(--primary), #60a5fa);
   transition: width 0.4s ease-out;
+  border-radius: 3px;
+}
+
+.gp-fill.conversion {
+  background: linear-gradient(90deg, #10b981, #34d399);
 }
 
 .gp-footer {
   display: flex;
-  gap: 1.5rem;
+  flex-wrap: wrap;
+  gap: 1.25rem;
   font-size: 0.8rem;
   color: var(--text-muted);
+  margin-top: 1rem;
+  padding-top: 0.85rem;
+  border-top: 1px solid rgba(255,255,255,0.05);
 }
 
 .gp-stat {
@@ -397,14 +428,30 @@ body {
   gap: 0.4rem;
 }
 
+.gp-stat.reconn {
+  color: #f59e0b;
+  font-weight: 500;
+}
+
 .dot {
   width: 8px;
   height: 8px;
   border-radius: 50%;
+  flex-shrink: 0;
 }
 .dot.waiting { background: #64748b; }
 .dot.in-progress { background: var(--accent); }
 .dot.completed { background: var(--success); }
+.dot.error { background: var(--error); }
+
+.spin-icon {
+  animation: spin 1.5s linear infinite;
+}
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
 
 /* Queue List Items PRO */
 .queue-list-pro {
@@ -480,12 +527,19 @@ body {
 .status-dot.Pronto { background: #64748b; }
 .status-dot.Pendente { background: #64748b; }
 .status-dot.Enviando { background: var(--accent); box-shadow: 0 0 5px var(--accent); }
+.status-dot.Confirmando { background: #38bdf8; box-shadow: 0 0 6px #38bdf8; animation: pulse-dot 1s infinite alternate; }
 .status-dot.Aguardando { background: #94a3b8; }
 .status-dot.Analisando { background: var(--warning); }
 .status-dot.Convertendo { background: var(--accent); box-shadow: 0 0 5px var(--accent); }
+.status-dot.Finalizando { background: #34d399; box-shadow: 0 0 6px #34d399; animation: pulse-dot 1s infinite alternate; }
 .status-dot.Concluído { background: var(--success); }
 .status-dot.Erro { background: var(--error); }
 .status-dot.Cancelado { background: #475569; }
+
+@keyframes pulse-dot {
+  0% { opacity: 0.5; transform: scale(0.85); }
+  100% { opacity: 1; transform: scale(1.15); }
+}
 
 .job-percentage {
   margin-left: auto;
@@ -512,6 +566,7 @@ body {
   background: var(--accent);
   transition: width 0.3s cubic-bezier(0.4, 0, 0.2, 1);
 }
+.job-progress-fill.Finalizando { background: #34d399; }
 .job-progress-fill.Concluído { background: var(--success); }
 .job-progress-fill.Erro { background: var(--error); }
 .job-progress-fill.indeterminate {
@@ -665,8 +720,20 @@ body {
     display: none;
   }
   
+  .hero {
+    padding: 2rem 1rem 0.5rem;
+  }
+  
   .hero h1 {
-    font-size: 2.5rem;
+    font-size: 2.25rem;
+  }
+  
+  .workspace {
+    margin: 1rem auto 2rem;
+  }
+  
+  .dropzone {
+    padding: 2.25rem 1.25rem;
   }
   
   .features {
